@@ -1,0 +1,7 @@
+{
+  "name": "JobHunter Pro",
+  "short_name": "JobHunter",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff"
+}
