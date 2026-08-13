@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { base44 } from '@/api/base44Client';
 import { toast } from 'sonner';
 import { generateInterviewPrep } from '@/lib/jobUtils';
-import { Loader2, ArrowLeft, FileText, Briefcase, CheckCircle2, XCircle, Copy } from 'lucide-react';
+import { Loader2, ArrowLeft, FileText, Briefcase } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';

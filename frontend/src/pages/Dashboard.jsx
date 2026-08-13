@@ -6,7 +6,6 @@ import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { useRefresh } from '@/lib/RefreshContext';
-import { RefreshProvider } from '@/lib/RefreshContext';
 
 function StatCard({ icon: Icon, label, value, accent, loading }) {
   return (

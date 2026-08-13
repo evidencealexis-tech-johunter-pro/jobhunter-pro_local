@@ -2,10 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { base44 } from '@/api/base44Client';
 import { toast } from 'sonner';
 import { analyzeResume, scoreJob } from '@/lib/jobUtils';
-import { 
-  FileText, Upload, Loader2, CheckCircle2, Star, 
-  Lightbulb, Award, Trash2, Briefcase, Building2, Clock, Copy, Check 
-} from 'lucide-react';
+import { Upload, Loader2, CheckCircle2, Star, Lightbulb, Trash2, Briefcase, Building2, Copy, Check } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
