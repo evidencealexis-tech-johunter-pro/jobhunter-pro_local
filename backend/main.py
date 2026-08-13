@@ -2,12 +2,13 @@ import os
 import json
 import sqlite3
 import uuid
+import secrets
 import time
 import asyncio
 import socket
 from datetime import date, datetime, timezone
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import Depends, FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
@@ -17,6 +18,15 @@ from scraper import detect_and_fetch, normalize_job
 from encryption import encrypt_api_key, decrypt_api_key, detect_provider_from_key
 from remote_config import load_config
 from pydantic import BaseModel
+from auth import (
+    CurrentUser,
+    CurrentUserDep,
+    hash_password,
+    normalize_email,
+    issue_access_token,
+    revoke_token,
+    verify_password,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -26,16 +36,135 @@ async def lifespan(app: FastAPI):
         conn.execute(f'CREATE TABLE IF NOT EXISTS {entity} (id TEXT PRIMARY KEY, data TEXT)')
 
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            name TEXT,
+            password_hash TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_login_at TEXT
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_token_hash
+        ON auth_sessions(token_hash)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id
+        ON auth_sessions(user_id)
+        """
+    )
+
+    conn.execute(
         "UPDATE ScrapeJob SET data = json_set(data, '$.status', 'interrupted') "
         "WHERE json_extract(data, '$.status') = 'running'"
     )
     conn.commit()
     conn.close()
     yield
-    
+
 # --- SETUP ---
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'), override=True)
 app = FastAPI(lifespan=lifespan)
+
+# ======================== AUTHENTICATION FOUNDATION ========================
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/apps/local/auth/login")
+async def login(body: LoginRequest):
+    email = normalize_email(body.email)
+
+    if not email or not body.password:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    conn = get_db()
+    try:
+        user = conn.execute(
+            """
+            SELECT id, email, name, password_hash, is_active
+            FROM users
+            WHERE email = ?
+            LIMIT 1
+            """,
+            (email,),
+        ).fetchone()
+
+        if not user or not verify_password(body.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        if not user["is_active"]:
+            raise HTTPException(status_code=403, detail="Account is disabled")
+
+        now = datetime.now(timezone.utc).isoformat()
+        token = issue_access_token(conn, user["id"])
+
+        conn.execute(
+            """
+            UPDATE users
+            SET last_login_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, now, user["id"]),
+        )
+
+        conn.commit()
+
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "name": user["name"],
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/apps/auth/logout")
+async def logout(request: Request):
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+
+    if scheme.lower() == "bearer" and token.strip():
+        conn = get_db()
+        try:
+            revoke_token(conn, token.strip())
+            conn.commit()
+        finally:
+            conn.close()
+
+    return {"message": "Logged out successfully"}
+
+
 
 RATE_LIMIT_SECONDS = 4   # seconds between LLM calls (15 RPM)
 
@@ -74,6 +203,11 @@ VALID_ENTITIES = {'Resume', 'Job', 'ScrapeSource', 'ContextDocument',
 def _validate_entity(entity_name: str) -> str:
     if entity_name not in VALID_ENTITIES:
         raise HTTPException(status_code=400, detail=f'Invalid entity: {entity_name}')
+    if entity_name == "UserApiKey":
+        raise HTTPException(
+            status_code=403,
+            detail="UserApiKey is managed through authenticated settings endpoints",
+        )
     return entity_name
 
 def _friendly_provider_error(e: Exception, provider: str = None) -> str:
@@ -315,7 +449,10 @@ class SaveApiKeyRequest(BaseModel):
 # ======================== BYOK KEY MANAGEMENT ========================
 
 @app.post("/api/settings/api-key")
-async def save_api_key(body: SaveApiKeyRequest):
+async def save_api_key(
+    body: SaveApiKeyRequest,
+    current_user: CurrentUser = CurrentUserDep,
+):
     api_key = body.api_key.strip()
     provider = (body.provider or "").strip().lower() or None
     user_model = (body.model or "").strip() or None
@@ -344,7 +481,7 @@ async def save_api_key(body: SaveApiKeyRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=_friendly_provider_error(e, provider=provider))
 
-        _store_key(api_key, provider="custom", model=user_model, label=label, base_url=base_url)
+        _store_key(api_key, current_user.id, provider="custom", model=user_model, label=label, base_url=base_url)
         return {"status": "success", "message": "Custom provider key saved and activated"}
 
     if provider and provider != "auto":
@@ -367,7 +504,7 @@ async def save_api_key(body: SaveApiKeyRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=_friendly_provider_error(e, provider=provider))
         stored_model = user_model if user_model else None
-        _store_key(api_key, provider=provider, model=stored_model, label=label)
+        _store_key(api_key, current_user.id, provider=provider, model=stored_model, label=label)
         return {"status": "success", "message": f"{provider} key saved and activated"}
 
     detected = detect_provider_from_key(api_key)
@@ -398,17 +535,20 @@ async def save_api_key(body: SaveApiKeyRequest):
             "providers": config["providers"],
         }
 
-    _store_key(api_key, provider=detected, model=None, label=label)
+    _store_key(api_key, current_user.id, provider=detected, model=None, label=label)
     return {"status": "success", "message": f"Detected {detected} - key saved and activated"}
 
 
-def _store_key(api_key, provider, model, label, base_url=None):
+def _store_key(api_key, user_id, provider, model, label, base_url=None):
     encrypted = encrypt_api_key(api_key)
     key_suffix = api_key[-4:] if len(api_key) >= 4 else "****"
     conn = get_db()
 
     cursor = conn.execute(
-        "SELECT data FROM UserApiKey WHERE json_extract(data, '$.status') = 'active'"
+        "SELECT data FROM UserApiKey "
+        "WHERE json_extract(data, '$.status') = 'active' "
+        "AND json_extract(data, '$.user_id') = ?",
+        (user_id,),
     )
     for row in cursor.fetchall():
         existing = json.loads(row["data"])
@@ -419,6 +559,7 @@ def _store_key(api_key, provider, model, label, base_url=None):
     new_id = str(uuid.uuid4())
     new_key = {
         "id": new_id,
+        "user_id": user_id,
         "provider": provider,
         "encrypted_key": encrypted,
         "key_suffix": key_suffix,
@@ -437,10 +578,13 @@ def _store_key(api_key, provider, model, label, base_url=None):
 
 
 @app.delete("/api/settings/api-key")
-async def remove_api_key():
+async def remove_api_key(current_user: CurrentUser = CurrentUserDep):
     conn = get_db()
     cursor = conn.execute(
-        "SELECT data FROM UserApiKey WHERE json_extract(data, '$.status') = 'active'"
+        "SELECT data FROM UserApiKey "
+        "WHERE json_extract(data, '$.status') = 'active' "
+        "AND json_extract(data, '$.user_id') = ?",
+        (current_user.id,),
     )
     row = cursor.fetchone()
     if not row:
@@ -457,10 +601,13 @@ async def remove_api_key():
 
 
 @app.get("/api/settings/api-key/status")
-async def api_key_status():
+async def api_key_status(current_user: CurrentUser = CurrentUserDep):
     conn = get_db()
     cursor = conn.execute(
-        "SELECT data FROM UserApiKey WHERE json_extract(data, '$.status') = 'active'"
+        "SELECT data FROM UserApiKey "
+        "WHERE json_extract(data, '$.status') = 'active' "
+        "AND json_extract(data, '$.user_id') = ?",
+        (current_user.id,),
     )
     row = cursor.fetchone()
     conn.close()
@@ -488,10 +635,13 @@ async def get_providers():
 
 # ======================== CORE LLM CALL (sync - used by resume scan) ========================
 
-def get_active_llm_credentials():
+def get_active_llm_credentials(user_id: str):
     conn = get_db()
     cursor = conn.execute(
-        "SELECT data FROM UserApiKey WHERE json_extract(data, '$.status') = 'active'"
+        "SELECT data FROM UserApiKey "
+        "WHERE json_extract(data, '$.status') = 'active' "
+        "AND json_extract(data, '$.user_id') = ?",
+        (user_id,),
     )
     row = cursor.fetchone()
     conn.close()
@@ -506,8 +656,13 @@ def get_active_llm_credentials():
     return provider, api_key, model
 
 
-def call_llm_with_retry(system_prompt: str = "", user_prompt: str = "",
-                        max_retries: int = 3, model: str = None):
+def call_llm_with_retry(
+    system_prompt: str = "",
+    user_prompt: str = "",
+    max_retries: int = 3,
+    model: str = None,
+    user_id: str | None = None,
+):
     """
     max_retries default raised from 1 to 3, and the loop rewritten as a
     while-loop with an explicit attempt counter. The old `for attempt in
@@ -520,7 +675,10 @@ def call_llm_with_retry(system_prompt: str = "", user_prompt: str = "",
     """
     time.sleep(RATE_LIMIT_SECONDS)
 
-    provider, api_key, active_model = get_active_llm_credentials()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    provider, api_key, active_model = get_active_llm_credentials(user_id)
     if model is None:
         model = active_model
 
@@ -576,12 +734,20 @@ def call_llm_with_retry(system_prompt: str = "", user_prompt: str = "",
 
 # ======================== CORE LLM CALL (async - used by background scrape) ========================
 
-async def call_llm_with_retry_async(system_prompt: str = "", user_prompt: str = "",
-                                     max_retries: int = 3, model: str = None):
+async def call_llm_with_retry_async(
+    system_prompt: str = "",
+    user_prompt: str = "",
+    max_retries: int = 3,
+    model: str = None,
+    user_id: str | None = None,
+):
     """Same fix as the sync version above - see its docstring for why."""
     await asyncio.sleep(RATE_LIMIT_SECONDS)
 
-    provider, api_key, active_model = get_active_llm_credentials()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    provider, api_key, active_model = get_active_llm_credentials(user_id)
     if model is None:
         model = active_model
 
@@ -642,7 +808,10 @@ class InvokeLLMRequest(BaseModel):
 # ======================== INVOKE LLM (Generic endpoint - unchanged) ========================
 
 @app.post("/api/apps/local/integration-endpoints/Core/InvokeLLM")
-async def invoke_llm(body: InvokeLLMRequest):
+async def invoke_llm(
+    body: InvokeLLMRequest,
+    current_user: CurrentUser = CurrentUserDep,
+):
     prompt = body.prompt
     response_schema = body.response_json_schema
     file_urls = body.file_urls or []
@@ -674,7 +843,12 @@ async def invoke_llm(body: InvokeLLMRequest):
         "Never inflate scores. Return ONLY valid JSON."
     )
 
-    result = await asyncio.to_thread(call_llm_with_retry, system_prompt=system_prompt, user_prompt=user_content)
+    result = await asyncio.to_thread(
+        call_llm_with_retry,
+        system_prompt=system_prompt,
+        user_prompt=user_content,
+        user_id=current_user.id,
+    )
     if result:
         result["status"] = "success"
         add_notification("AI analysis completed successfully.", type="success")
@@ -726,7 +900,10 @@ class ScrapeJobsRequest(BaseModel):
     domain_weight: int = 20
 @app.post("/api/apps/local/integration-endpoints/Core/ScrapeJobs")
 
-async def scrape_jobs(body: ScrapeJobsRequest):
+async def scrape_jobs(
+    body: ScrapeJobsRequest,
+    current_user: CurrentUser = CurrentUserDep,
+):
     req_data = body.model_dump()
     job_id = str(uuid.uuid4())
     initial_state = {
@@ -750,7 +927,7 @@ async def scrape_jobs(body: ScrapeJobsRequest):
     save_job_state(job_id, initial_state)
 
     add_notification(f"Started scanning {initial_state['source_label']}", type="info")
-    task = asyncio.create_task(run_scrape(job_id, req_data))
+    task = asyncio.create_task(run_scrape(job_id, req_data, current_user.id))
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
 
@@ -821,7 +998,7 @@ def cheap_prefilter_match(resume_skills, job_title, job_description, min_overlap
     return matches >= min_overlap
 
 
-async def run_scrape(job_id: str, req_data: dict):
+async def run_scrape(job_id: str, req_data: dict, user_id: str):
     try:
         source_url = req_data.get("source_url", "")
         # Same value used when the job started - keeping this consistent
@@ -874,7 +1051,7 @@ async def run_scrape(job_id: str, req_data: dict):
 
         if fetch_status == "generic":
             update_job_state(job_id, stage="Reading job listings with AI...")
-            raw_jobs = await extract_jobs_via_llm_async(fetch_data, source_url)
+            raw_jobs = await extract_jobs_via_llm_async(fetch_data, source_url, user_id)
             if not raw_jobs:
                 update_job_state(job_id, status="completed", message="No job listings found.")
                 add_notification(f"Finished scanning {source_label}: no job listings found on the page", type="info")
@@ -956,7 +1133,11 @@ async def run_scrape(job_id: str, req_data: dict):
                 f"Job Description: {job['description'][:3000]}"
             )
 
-            result = await call_llm_with_retry_async(system_prompt=ATS_SYSTEM_PROMPT, user_prompt=user_prompt)
+            result = await call_llm_with_retry_async(
+                system_prompt=ATS_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                user_id=user_id,
+            )
 
             current_state = get_job_state(job_id)
             if current_state and current_state.get("cancel"):
@@ -1021,7 +1202,7 @@ async def run_scrape(job_id: str, req_data: dict):
         add_notification(f"Scan failed: {str(e)}", type="error")
 
 
-async def extract_jobs_via_llm_async(html, source_url):
+async def extract_jobs_via_llm_async(html, source_url, user_id: str):
     system_prompt = (
         "You extract real job postings from raw webpage HTML. "
         "Return ONLY valid JSON: {\"jobs\": [{\"title\": string, \"company\": string, "
@@ -1030,7 +1211,12 @@ async def extract_jobs_via_llm_async(html, source_url):
     )
     user_prompt = f"Page URL: {source_url}\n\nHTML:\n{html}"
     try:
-        result = await call_llm_with_retry_async(system_prompt=system_prompt, user_prompt=user_prompt, max_retries=1)
+        result = await call_llm_with_retry_async(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_retries=1,
+            user_id=user_id,
+        )
         if not result:
             return []
         raw = result.get("jobs", [])
@@ -1045,8 +1231,13 @@ async def track_analytics():
     return {"status": "ok"}
 
 @app.get("/api/apps/local/entities/User/me")
-async def get_user():
-    return {"id": "user-1", "name": "User"}
+async def get_user(current_user: CurrentUser = CurrentUserDep):
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "name": current_user.name,
+        "is_active": current_user.is_active,
+    }
 
 @app.get("/api/apps/public/prod/public-settings/by-id/local")
 async def get_settings():
