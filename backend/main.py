@@ -246,101 +246,314 @@ def get_db():
     return conn
 
 # ======================== CRUD ROUTING (unchanged) ========================
+# ======================== CRUD ROUTING ========================
+
+def _resume_scope_user(current_user: CurrentUser = CurrentUserDep) -> CurrentUser:
+    """Dependency used by Resume CRUD so ownership is always server-derived."""
+    return current_user
+
+
 @app.get("/api/apps/local/entities/{entity_name}")
-async def get_entities(entity_name: str, q: Optional[str] = None, sort: Optional[str] = None, limit: Optional[int] = None):
+async def get_entities(
+    entity_name: str,
+    q: Optional[str] = None,
+    sort: Optional[str] = None,
+    limit: Optional[int] = None,
+    current_user: CurrentUser = Depends(_resume_scope_user),
+):
     _validate_entity(entity_name)
+
     conn = get_db()
-    cursor = conn.execute(f"SELECT data FROM {entity_name}")
-    rows = cursor.fetchall()
-    conn.close()
-    items = [json.loads(row['data']) for row in rows]
+
+    try:
+        if entity_name == "Resume":
+            cursor = conn.execute(
+                """
+                SELECT data
+                FROM Resume
+                WHERE json_extract(data, '$.user_id') = ?
+                """,
+                (current_user.id,),
+            )
+        else:
+            cursor = conn.execute(f"SELECT data FROM {entity_name}")
+
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    items = [json.loads(row["data"]) for row in rows]
 
     if q:
         try:
             filters = json.loads(q)
+
             if not isinstance(filters, dict):
-                raise HTTPException(status_code=400, detail='Filter must be a JSON object')
-            items = [item for item in items if all(item.get(k) == v for k, v in filters.items())]
+                raise HTTPException(
+                    status_code=400,
+                    detail="Filter must be a JSON object",
+                )
+
+            items = [
+                item
+                for item in items
+                if all(item.get(k) == v for k, v in filters.items())
+            ]
+
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail='Invalid JSON in filter')
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid JSON in filter",
+            )
+
     if sort:
-        descending = sort.startswith('-')
+        descending = sort.startswith("-")
         field = sort[1:] if descending else sort
-        items.sort(key=lambda item: str(item.get(field) or ''), reverse=descending)
+
+        items.sort(
+            key=lambda item: str(item.get(field) or ""),
+            reverse=descending,
+        )
+
     if limit is not None:
         items = items[:limit]
+
     return items
 
 
 class EntityPayload(BaseModel):
     model_config = {"extra": "allow"}
+
+
 @app.post("/api/apps/local/entities/{entity_name}")
-async def post_entities(entity_name: str, body: EntityPayload):
+async def post_entities(
+    entity_name: str,
+    body: EntityPayload,
+    current_user: CurrentUser = Depends(_resume_scope_user),
+):
     _validate_entity(entity_name)
+
     data = body.model_dump()
+
     item_id = data.get("id") or str(uuid.uuid4())
     data["id"] = item_id
+
     if "created_date" not in data:
         data["created_date"] = date.today().isoformat()
+
+    # Resume ownership is always derived from the authenticated session.
+    # A client-provided user_id is ignored.
+    if entity_name == "Resume":
+        data["user_id"] = current_user.id
+
     conn = get_db()
-    conn.execute(f"INSERT OR REPLACE INTO {entity_name} (id, data) VALUES (?, ?)",
-                 (item_id, json.dumps(data)))
-    conn.commit()
-    conn.close()
+
+    try:
+        if entity_name == "Resume" and data.get("active") is True:
+            conn.execute(
+                """
+                UPDATE Resume
+                SET data = json_set(data, '$.active', json('false'))
+                WHERE json_extract(data, '$.user_id') = ?
+                """,
+                (current_user.id,),
+            )
+
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {entity_name} (id, data)
+            VALUES (?, ?)
+            """,
+            (item_id, json.dumps(data)),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
     return data
+
 
 @app.put("/api/apps/local/entities/{entity_name}/{item_id}")
 @app.patch("/api/apps/local/entities/{entity_name}/{item_id}")
-async def update_entity(entity_name: str, item_id: str, body: EntityPayload):
+async def update_entity(
+    entity_name: str,
+    item_id: str,
+    body: EntityPayload,
+    current_user: CurrentUser = Depends(_resume_scope_user),
+):
     _validate_entity(entity_name)
+
     updates = body.model_dump()
     conn = get_db()
-    cursor = conn.execute(f"SELECT data FROM {entity_name} WHERE id = ?", (item_id,))
-    row = cursor.fetchone()
-    if not row:
+
+    try:
+        if entity_name == "Resume":
+            cursor = conn.execute(
+                """
+                SELECT data
+                FROM Resume
+                WHERE id = ?
+                  AND json_extract(data, '$.user_id') = ?
+                """,
+                (item_id, current_user.id),
+            )
+        else:
+            cursor = conn.execute(
+                f"SELECT data FROM {entity_name} WHERE id = ?",
+                (item_id,),
+            )
+
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Item not found",
+            )
+
+        existing = json.loads(row["data"])
+
+        # Ownership is immutable and server controlled.
+        if entity_name == "Resume":
+            updates.pop("user_id", None)
+            existing["user_id"] = current_user.id
+
+        existing.update(updates)
+        existing["id"] = item_id
+
+        if entity_name == "Resume" and existing.get("active") is True:
+            conn.execute(
+                """
+                UPDATE Resume
+                SET data = json_set(data, '$.active', json('false'))
+                WHERE json_extract(data, '$.user_id') = ?
+                  AND id != ?
+                """,
+                (current_user.id, item_id),
+            )
+
+        conn.execute(
+            f"""
+            UPDATE {entity_name}
+            SET data = ?
+            WHERE id = ?
+            """,
+            (json.dumps(existing), item_id),
+        )
+
+        conn.commit()
+
+        return existing
+
+    finally:
         conn.close()
-        raise HTTPException(status_code=404, detail="Item not found")
-    existing = json.loads(row['data'])
-    existing.update(updates)
-    existing["id"] = item_id
-    conn.execute(f"UPDATE {entity_name} SET data = ? WHERE id = ?", (json.dumps(existing), item_id))
-    conn.commit()
-    conn.close()
-    return existing
+
 
 # IMPORTANT: this specific route (Job/clear-all) MUST be registered before
-# the generic "/{entity_name}/{item_id}" delete route below. FastAPI/
-# Starlette matches routes in registration order, not by specificity - if
-# the generic route were registered first, "clear-all" would be swallowed
-# as if it were an item_id, silently deleting nothing and still returning
-# a fake success. This bit us once already; don't move this route down.
+# the generic "/{entity_name}/{item_id}" delete route below.
 @app.delete("/api/apps/local/entities/Job/clear-all")
-async def clear_all_jobs():
+async def clear_all_jobs(current_user: CurrentUser = CurrentUserDep):
     conn = get_db()
-    conn.execute("DELETE FROM Job")
-    conn.commit()
-    conn.close()
-    return {"status": "success", "message": "All jobs cleared"}
+
+    try:
+        conn.execute("DELETE FROM Job")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "status": "success",
+        "message": "All jobs cleared",
+    }
+
 
 @app.delete("/api/apps/local/entities/{entity_name}/{item_id}")
-async def delete_entity(entity_name: str, item_id: str):
+async def delete_entity(
+    entity_name: str,
+    item_id: str,
+    current_user: CurrentUser = Depends(_resume_scope_user),
+):
     _validate_entity(entity_name)
-    if item_id == "undefined": return {"status": "ignored"}
+
+    if item_id == "undefined":
+        return {"status": "ignored"}
+
     conn = get_db()
-    conn.execute(f"DELETE FROM {entity_name} WHERE id = ?", (item_id,))
-    conn.commit()
-    conn.close()
+
+    try:
+        if entity_name == "Resume":
+            cursor = conn.execute(
+                """
+                DELETE FROM Resume
+                WHERE id = ?
+                  AND json_extract(data, '$.user_id') = ?
+                """,
+                (item_id, current_user.id),
+            )
+        else:
+            cursor = conn.execute(
+                f"DELETE FROM {entity_name} WHERE id = ?",
+                (item_id,),
+            )
+
+        if entity_name == "Resume" and cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Item not found",
+            )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
     return {"status": "deleted"}
 
+
 @app.delete("/api/apps/local/entities/{entity_name}")
-async def delete_entity_by_query(entity_name: str, id: str):
+async def delete_entity_by_query(
+    entity_name: str,
+    id: str,
+    current_user: CurrentUser = Depends(_resume_scope_user),
+):
     _validate_entity(entity_name)
-    if id == "undefined": return {"status": "ignored"}
+
+    if id == "undefined":
+        return {"status": "ignored"}
+
     conn = get_db()
-    conn.execute(f"DELETE FROM {entity_name} WHERE id = ?", (id,))
-    conn.commit()
-    conn.close()
+
+    try:
+        if entity_name == "Resume":
+            cursor = conn.execute(
+                """
+                DELETE FROM Resume
+                WHERE id = ?
+                  AND json_extract(data, '$.user_id') = ?
+                """,
+                (id, current_user.id),
+            )
+        else:
+            cursor = conn.execute(
+                f"DELETE FROM {entity_name} WHERE id = ?",
+                (id,),
+            )
+
+        if entity_name == "Resume" and cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Item not found",
+            )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
     return {"status": "deleted"}
+
 
 # ======================== NOTIFICATIONS ========================
 #
@@ -923,6 +1136,7 @@ async def scrape_jobs(
         # "reconnecting" message needed anywhere.
         "source_label": req_data.get("source_name") or req_data.get("source_url", ""),
         "stage": "Starting scan...",
+        "user_id": current_user.id,
     }
     save_job_state(job_id, initial_state)
 
@@ -1015,10 +1229,22 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
         }
 
         conn = get_db()
-        cursor = conn.execute("SELECT data FROM Resume")
-        resumes = [json.loads(r['data']) for r in cursor.fetchall()]
-        conn.close()
-        active_resume = next((r for r in resumes if r.get("active")), None)
+        try:
+            cursor = conn.execute(
+                """
+                SELECT data
+                FROM Resume
+                WHERE json_extract(data, '$.user_id') = ?
+                  AND json_extract(data, '$.active') = 1
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+
+        active_resume = json.loads(row["data"]) if row else None
         if not active_resume:
             update_job_state(job_id, status="error", message="No active resume found. Upload a resume first.")
             return

@@ -1,68 +1,198 @@
-"""
-Regression test for a real bug found during testing: the generic
-DELETE /{entity_name}/{item_id} route was registered BEFORE the specific
-DELETE /Job/clear-all route, so FastAPI matched "clear-all" as if it were
-an item_id and silently deleted nothing - while still returning 200 OK,
-making it look like it worked when it didn't.
-
-This test creates real Job rows, calls the clear-all endpoint, and checks
-the database directly - not just the HTTP status code - so it can never
-pass while silently doing nothing again.
-"""
-import json
-import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+import uuid
+from datetime import datetime, timezone
+
+sys.path.insert(
+    0,
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+
+import main as app_module
+from auth import hash_password
 
 
-def test_clear_all_actually_deletes_every_job(client, temp_db_path):
-    import sqlite3
+TEST_PASSWORD = "CorrectHorseBatteryStaple!"
 
-    # Seed 3 fake jobs directly into the test database
-    conn = sqlite3.connect(temp_db_path)
-    for i in range(3):
-        conn.execute(
-            "INSERT INTO Job (id, data) VALUES (?, ?)",
-            (f"job-{i}", json.dumps({"id": f"job-{i}", "title": f"Test Job {i}"})),
+
+def create_user(email="test@example.com", name="Test User"):
+    conn = app_module.get_db()
+
+    user_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn.execute(
+        """
+        INSERT INTO users (
+            id,
+            email,
+            name,
+            password_hash,
+            is_active,
+            created_at,
+            updated_at,
+            last_login_at
         )
-    conn.commit()
-
-    # Sanity check: the jobs are really there before we clear anything
-    count_before = conn.execute("SELECT COUNT(*) FROM Job").fetchone()[0]
-    assert count_before == 3
-    conn.close()
-
-    # Call the actual endpoint the frontend's "Clear All Jobs" button hits
-    response = client.delete("/api/apps/local/entities/Job/clear-all")
-    assert response.status_code == 200
-    assert response.json()["status"] == "success"
-
-    # THE REAL CHECK: verify the database, not just the HTTP response.
-    # A 200 OK alone is exactly what fooled everyone during the original bug.
-    conn = sqlite3.connect(temp_db_path)
-    count_after = conn.execute("SELECT COUNT(*) FROM Job").fetchone()[0]
-    conn.close()
-    assert count_after == 0, (
-        "Clear All returned success but jobs still exist - this is the "
-        "exact route-ordering regression that happened before."
+        VALUES (?, ?, ?, ?, 1, ?, ?, NULL)
+        """,
+        (
+            user_id,
+            email,
+            name,
+            hash_password(TEST_PASSWORD),
+            now,
+            now,
+        ),
     )
 
-
-def test_deleting_a_single_job_by_id_still_works(client, temp_db_path):
-    """Make sure fixing the clear-all route didn't break normal single-item
-    deletes, which go through the generic /{entity_name}/{item_id} route."""
-    import sqlite3
-
-    conn = sqlite3.connect(temp_db_path)
-    conn.execute("INSERT INTO Job (id, data) VALUES (?, ?)", ("job-x", json.dumps({"id": "job-x"})))
-    conn.execute("INSERT INTO Job (id, data) VALUES (?, ?)", ("job-y", json.dumps({"id": "job-y"})))
     conn.commit()
     conn.close()
 
-    response = client.delete("/api/apps/local/entities/Job/job-x")
+    return user_id
+
+
+def login_as(client, email="test@example.com"):
+    response = client.post(
+        "/api/apps/local/auth/login",
+        json={
+            "email": email,
+            "password": TEST_PASSWORD,
+        },
+    )
+
     assert response.status_code == 200
 
-    conn = sqlite3.connect(temp_db_path)
-    remaining_ids = [row[0] for row in conn.execute("SELECT id FROM Job").fetchall()]
-    conn.close()
-    assert remaining_ids == ["job-y"]
+    token = response.json()["access_token"]
+
+    return {
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def create_job(
+    client,
+    headers,
+    *,
+    job_id=None,
+    title="Test Job",
+    dedup_hash=None,
+):
+    job_id = job_id or str(uuid.uuid4())
+
+    response = client.post(
+        "/api/apps/local/entities/Job",
+        headers=headers,
+        json={
+            "id": job_id,
+            "title": title,
+            "company": "Test Company",
+            "description": "Test job description",
+            "dedup_hash": dedup_hash or str(uuid.uuid4()),
+            "dismissed": False,
+        },
+    )
+
+    assert response.status_code == 200
+
+    return response.json()
+
+
+def test_clear_all_actually_deletes_every_job(
+    client,
+    temp_db_path,
+):
+    create_user()
+
+    headers = login_as(client)
+
+    create_job(
+        client,
+        headers,
+        title="Job One",
+    )
+
+    create_job(
+        client,
+        headers,
+        title="Job Two",
+    )
+
+    create_job(
+        client,
+        headers,
+        title="Job Three",
+    )
+
+    before = client.get(
+        "/api/apps/local/entities/Job",
+        headers=headers,
+    )
+
+    assert before.status_code == 200
+    assert len(before.json()) == 3
+
+    response = client.delete(
+        "/api/apps/local/entities/Job/clear-all",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["status"] == "success"
+
+    after = client.get(
+        "/api/apps/local/entities/Job",
+        headers=headers,
+    )
+
+    assert after.status_code == 200
+    assert after.json() == []
+
+
+def test_deleting_a_single_job_by_id_still_works(
+    client,
+    temp_db_path,
+):
+    create_user()
+
+    headers = login_as(client)
+
+    job = create_job(
+        client,
+        headers,
+        title="Job To Delete",
+    )
+
+    remaining_job = create_job(
+        client,
+        headers,
+        title="Job To Keep",
+    )
+
+    response = client.delete(
+        f"/api/apps/local/entities/Job/{job['id']}",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["status"] == "deleted"
+
+    jobs = client.get(
+        "/api/apps/local/entities/Job",
+        headers=headers,
+    )
+
+    assert jobs.status_code == 200
+
+    jobs_by_id = {
+        item["id"]: item
+        for item in jobs.json()
+    }
+
+    assert job["id"] not in jobs_by_id
+    assert remaining_job["id"] in jobs_by_id
