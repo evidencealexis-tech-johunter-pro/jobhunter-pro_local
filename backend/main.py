@@ -202,12 +202,17 @@ VALID_ENTITIES = {'Resume', 'Job', 'ScrapeSource', 'ContextDocument',
 
 def _validate_entity(entity_name: str) -> str:
     if entity_name not in VALID_ENTITIES:
-        raise HTTPException(status_code=400, detail=f'Invalid entity: {entity_name}')
-    if entity_name == "UserApiKey":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid entity: {entity_name}",
+        )
+
+    if entity_name in {"UserApiKey", "Notification"}:
         raise HTTPException(
             status_code=403,
-            detail="UserApiKey is managed through authenticated settings endpoints",
+            detail=f"{entity_name} is managed through authenticated endpoints",
         )
+
     return entity_name
 
 def _friendly_provider_error(e: Exception, provider: str = None) -> str:
@@ -569,29 +574,58 @@ async def delete_entity_by_query(
 # database, so the bell icon can show a full timestamped history even
 # after you've been away.
 
-def add_notification(message: str, type: str = "info", context: str = None):
-    """type: 'success' | 'error' | 'info' | 'warning'"""
+def add_notification(
+    message: str,
+    user_id: str,
+    type: str = "info",
+    context: str = None,
+):
+    """Create a notification owned exclusively by one authenticated user."""
+    if not user_id:
+        raise ValueError("Notification owner is required")
+
     conn = get_db()
-    new_id = str(uuid.uuid4())
-    notif = {
-        "id": new_id,
-        "message": message,
-        "type": type,
-        "context": context,
-        "read": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    conn.execute("INSERT INTO Notification (id, data) VALUES (?, ?)", (new_id, json.dumps(notif)))
-    conn.commit()
-    conn.close()
+    try:
+        new_id = str(uuid.uuid4())
+        notif = {
+            "id": new_id,
+            "user_id": user_id,
+            "message": message,
+            "type": type,
+            "context": context,
+            "read": False,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        conn.execute(
+            "INSERT INTO Notification (id, data) VALUES (?, ?)",
+            (new_id, json.dumps(notif)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.get("/api/notifications")
-async def get_notifications(limit: int = 50):
+async def get_notifications(
+    limit: int = 50,
+    current_user: CurrentUser = CurrentUserDep,
+):
+    limit = max(1, min(limit, 100))
+
     conn = get_db()
-    cursor = conn.execute("SELECT data FROM Notification")
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        cursor = conn.execute(
+            """
+            SELECT data
+            FROM Notification
+            WHERE json_extract(data, '$.user_id') = ?
+            """,
+            (current_user.id,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
     items = [json.loads(r["data"]) for r in rows]
     items.sort(key=lambda n: n.get("created_at", ""), reverse=True)
     unread_count = sum(1 for n in items if not n.get("read"))
@@ -599,20 +633,40 @@ async def get_notifications(limit: int = 50):
 
 
 @app.post("/api/notifications/mark-all-read")
-async def mark_all_notifications_read():
+async def mark_all_notifications_read(
+    current_user: CurrentUser = CurrentUserDep,
+):
     conn = get_db()
-    conn.execute("UPDATE Notification SET data = json_set(data, '$.read', json('true'))")
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.execute(
+            "SELECT data FROM Notification WHERE json_extract(data, '$.user_id') = ?",
+            (current_user.id,),
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            data = json.loads(row["data"])
+            data["read"] = True
+            conn.execute(
+                "UPDATE Notification SET data = ? WHERE id = ?",
+                (json.dumps(data), data["id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
     return {"status": "success"}
 
 
 @app.delete("/api/notifications")
-async def clear_notifications():
+async def clear_notifications(current_user: CurrentUser = CurrentUserDep):
     conn = get_db()
-    conn.execute("DELETE FROM Notification")
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "DELETE FROM Notification WHERE json_extract(data, '$.user_id') = ?",
+            (current_user.id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"status": "success"}
 
 
@@ -926,7 +980,7 @@ def call_llm_with_retry(
                 )
                 conn.commit()
                 conn.close()
-                add_notification("Your API key has expired or was rejected. Add a new one in Settings.", type="error")
+                add_notification("Your API key has expired or was rejected. Add a new one in Settings.", user_id=user_id, type="error")
                 raise HTTPException(status_code=400, detail="Your API key has expired. Please enter a new key in Settings.")
             elif "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 wait_time = 30
@@ -1070,9 +1124,9 @@ async def invoke_llm(
     )
     if result:
         result["status"] = "success"
-        add_notification("AI analysis completed successfully.", type="success")
+        add_notification("AI analysis completed successfully.", user_id=current_user.id, type="success")
         return result
-    add_notification("AI analysis failed. Check your API key and quota.", type="error")
+    add_notification("AI analysis failed. Check your API key and quota.", user_id=current_user.id, type="error")
     raise HTTPException(status_code=500, detail="LLM call failed. Check your API key and quota.")
 
 
@@ -1160,7 +1214,7 @@ async def scrape_jobs(
     }
     save_job_state(job_id, initial_state)
 
-    add_notification(f"Started scanning {initial_state['source_label']}", type="info")
+    add_notification(f"Started scanning {initial_state['source_label']}", user_id=current_user.id, type="info")
     task = asyncio.create_task(run_scrape(job_id, req_data, current_user.id))
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
@@ -1300,12 +1354,12 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
             )
         except asyncio.TimeoutError:
             update_job_state(job_id, status="error", message="This source took too long to respond and was skipped.")
-            add_notification(f"Skipped {source_label}: took too long to respond", type="warning")
+            add_notification(f"Skipped {source_label}: took too long to respond", user_id=user_id, type="warning")
             return
 
         if fetch_status == "error":
             update_job_state(job_id, status="error", message=fetch_data)
-            add_notification(f"Failed to scan {source_label}: {fetch_data}", type="error")
+            add_notification(f"Failed to scan {source_label}: {fetch_data}", user_id=user_id, type="error")
             return
 
         if fetch_status == "generic":
@@ -1313,7 +1367,7 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
             raw_jobs = await extract_jobs_via_llm_async(fetch_data, source_url, user_id)
             if not raw_jobs:
                 update_job_state(job_id, status="completed", message="No job listings found.")
-                add_notification(f"Finished scanning {source_label}: no job listings found on the page", type="info")
+                add_notification(f"Finished scanning {source_label}: no job listings found on the page", user_id=user_id, type="info")
                 return
         else:
             raw_jobs = fetch_data
@@ -1362,7 +1416,7 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
             current_state = get_job_state(job_id)
             if current_state and current_state.get("cancel"):
                 update_job_state(job_id, status="stopped")
-                add_notification(f"Stopped scanning {source_label} ({saved} job{'s' if saved != 1 else ''} saved before stopping)", type="info")
+                add_notification(f"Stopped scanning {source_label} ({saved} job{'s' if saved != 1 else ''} saved before stopping)", user_id=user_id, type="info")
                 return
 
             # Live ETA: based on real average time-per-job seen so far this
@@ -1415,7 +1469,7 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
             current_state = get_job_state(job_id)
             if current_state and current_state.get("cancel"):
                 update_job_state(job_id, status="stopped")
-                add_notification(f"Stopped scanning {source_label} ({saved} job{'s' if saved != 1 else ''} saved before stopping)", type="info")
+                add_notification(f"Stopped scanning {source_label} ({saved} job{'s' if saved != 1 else ''} saved before stopping)", user_id=user_id, type="info")
                 return
 
             if result is None:
@@ -1468,12 +1522,13 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
         add_notification(
             f"Finished scanning {source_label}: {saved} new job{'s' if saved != 1 else ''} found"
             + (f" ({skipped_prefilter} skipped instantly by pre-filter)" if skipped_prefilter else ""),
+            user_id=user_id,
             type="success",
         )
 
     except Exception as e:
         update_job_state(job_id, status="error", message=str(e))
-        add_notification(f"Scan failed: {str(e)}", type="error")
+        add_notification(f"Scan failed: {str(e)}", user_id=user_id, type="error")
 
 
 async def extract_jobs_via_llm_async(html, source_url, user_id: str):
