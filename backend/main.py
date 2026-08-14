@@ -266,11 +266,11 @@ async def get_entities(
     conn = get_db()
 
     try:
-        if entity_name == "Resume":
+        if entity_name in {"Resume", "Job"}:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT data
-                FROM Resume
+                FROM {entity_name}
                 WHERE json_extract(data, '$.user_id') = ?
                 """,
                 (current_user.id,),
@@ -341,9 +341,9 @@ async def post_entities(
     if "created_date" not in data:
         data["created_date"] = date.today().isoformat()
 
-    # Resume ownership is always derived from the authenticated session.
+    # Ownership is always derived from the authenticated session.
     # A client-provided user_id is ignored.
-    if entity_name == "Resume":
+    if entity_name in {"Resume", "Job"}:
         data["user_id"] = current_user.id
 
     conn = get_db()
@@ -389,11 +389,11 @@ async def update_entity(
     conn = get_db()
 
     try:
-        if entity_name == "Resume":
+        if entity_name in {"Resume", "Job"}:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT data
-                FROM Resume
+                FROM {entity_name}
                 WHERE id = ?
                   AND json_extract(data, '$.user_id') = ?
                 """,
@@ -416,7 +416,7 @@ async def update_entity(
         existing = json.loads(row["data"])
 
         # Ownership is immutable and server controlled.
-        if entity_name == "Resume":
+        if entity_name in {"Resume", "Job"}:
             updates.pop("user_id", None)
             existing["user_id"] = current_user.id
 
@@ -458,7 +458,13 @@ async def clear_all_jobs(current_user: CurrentUser = CurrentUserDep):
     conn = get_db()
 
     try:
-        conn.execute("DELETE FROM Job")
+        conn.execute(
+            """
+            DELETE FROM Job
+            WHERE json_extract(data, '$.user_id') = ?
+            """,
+            (current_user.id,),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -483,10 +489,10 @@ async def delete_entity(
     conn = get_db()
 
     try:
-        if entity_name == "Resume":
+        if entity_name in {"Resume", "Job"}:
             cursor = conn.execute(
-                """
-                DELETE FROM Resume
+                f"""
+                DELETE FROM {entity_name}
                 WHERE id = ?
                   AND json_extract(data, '$.user_id') = ?
                 """,
@@ -498,7 +504,7 @@ async def delete_entity(
                 (item_id,),
             )
 
-        if entity_name == "Resume" and cursor.rowcount == 0:
+        if entity_name in {"Resume", "Job"} and cursor.rowcount == 0:
             raise HTTPException(
                 status_code=404,
                 detail="Item not found",
@@ -526,10 +532,10 @@ async def delete_entity_by_query(
     conn = get_db()
 
     try:
-        if entity_name == "Resume":
+        if entity_name in {"Resume", "Job"}:
             cursor = conn.execute(
-                """
-                DELETE FROM Resume
+                f"""
+                DELETE FROM {entity_name}
                 WHERE id = ?
                   AND json_extract(data, '$.user_id') = ?
                 """,
@@ -541,7 +547,7 @@ async def delete_entity_by_query(
                 (id,),
             )
 
-        if entity_name == "Resume" and cursor.rowcount == 0:
+        if entity_name in {"Resume", "Job"} and cursor.rowcount == 0:
             raise HTTPException(
                 status_code=404,
                 detail="Item not found",
@@ -1077,14 +1083,28 @@ async def invoke_llm(
 # progress or its final result - only truly interrupts it, and that gets
 # marked honestly (see startup_event above) instead of vanishing silently.
 
-def get_job_state(job_id: str):
+def get_job_state(job_id: str, user_id: str | None = None):
     conn = get_db()
-    cursor = conn.execute("SELECT data FROM ScrapeJob WHERE id = ?", (job_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return json.loads(row["data"])
+    try:
+        if user_id is None:
+            cursor = conn.execute(
+                "SELECT data FROM ScrapeJob WHERE id = ?",
+                (job_id,),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                SELECT data
+                FROM ScrapeJob
+                WHERE id = ?
+                  AND json_extract(data, '$.user_id') = ?
+                """,
+                (job_id, user_id),
+            )
+        row = cursor.fetchone()
+        return json.loads(row["data"]) if row else None
+    finally:
+        conn.close()
 
 
 def save_job_state(job_id: str, state: dict):
@@ -1149,8 +1169,11 @@ async def scrape_jobs(
 
 
 @app.post("/api/apps/local/integration-endpoints/Core/ScrapeJobs/{job_id}/stop")
-async def stop_scrape(job_id: str):
-    state = get_job_state(job_id)
+async def stop_scrape(
+    job_id: str,
+    current_user: CurrentUser = CurrentUserDep,
+):
+    state = get_job_state(job_id, current_user.id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found")
     update_job_state(job_id, cancel=True)
@@ -1158,7 +1181,7 @@ async def stop_scrape(job_id: str):
 
 
 @app.get("/api/apps/local/integration-endpoints/Core/ScrapeJobs/current")
-async def get_current_scrape():
+async def get_current_scrape(current_user: CurrentUser = CurrentUserDep):
     """Lets the frontend ask 'is anything still running?' when a page loads,
     so navigating away and back doesn't lose track of an in-progress scan.
 
@@ -1167,7 +1190,14 @@ async def get_current_scrape():
     endpoint is hit on every JobDiscovery page load."""
     conn = get_db()
     cursor = conn.execute(
-        "SELECT id, data FROM ScrapeJob WHERE json_extract(data, '$.status') = 'running' LIMIT 1"
+        """
+        SELECT id, data
+        FROM ScrapeJob
+        WHERE json_extract(data, '$.status') = 'running'
+          AND json_extract(data, '$.user_id') = ?
+        LIMIT 1
+        """,
+        (current_user.id,),
     )
     row = cursor.fetchone()
     conn.close()
@@ -1178,8 +1208,11 @@ async def get_current_scrape():
 
 
 @app.get("/api/apps/local/integration-endpoints/Core/ScrapeJobs/{job_id}/status")
-async def scrape_status(job_id: str):
-    state = get_job_state(job_id)
+async def scrape_status(
+    job_id: str,
+    current_user: CurrentUser = CurrentUserDep,
+):
+    state = get_job_state(job_id, current_user.id)
     if not state:
         raise HTTPException(status_code=404, detail="Job not found")
     return state
@@ -1286,10 +1319,24 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
             raw_jobs = fetch_data
 
         conn = get_db()
-        cursor = conn.execute("SELECT data FROM Job")
-        existing_jobs = [json.loads(r['data']) for r in cursor.fetchall()]
-        conn.close()
-        existing_hashes = {j.get("dedup_hash") for j in existing_jobs if j.get("dedup_hash")}
+        try:
+            cursor = conn.execute(
+                """
+                SELECT data
+                FROM Job
+                WHERE json_extract(data, '$.user_id') = ?
+                """,
+                (user_id,),
+            )
+            existing_jobs = [json.loads(r["data"]) for r in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        existing_hashes = {
+            j.get("dedup_hash")
+            for j in existing_jobs
+            if j.get("dedup_hash")
+        }
 
         saved = 0
         skipped_duplicate = 0
@@ -1405,6 +1452,7 @@ async def run_scrape(job_id: str, req_data: dict, user_id: str):
             job_row_id = str(uuid.uuid4())
             job["id"] = job_row_id
             job["created_date"] = date.today().isoformat()
+            job["user_id"] = user_id
 
             conn = get_db()
             conn.execute("INSERT OR REPLACE INTO Job (id, data) VALUES (?, ?)", (job_row_id, json.dumps(job)))
