@@ -18,6 +18,13 @@ from scraper import detect_and_fetch, normalize_job
 from encryption import encrypt_api_key, decrypt_api_key, detect_provider_from_key
 from remote_config import load_config
 from pydantic import BaseModel
+from file_storage import (
+    MAX_UPLOAD_BYTES,
+    file_reference,
+    get_owned_file,
+    initialize_schema,
+    store_pdf,
+)
 from auth import (
     CurrentUser,
     CurrentUserDep,
@@ -77,6 +84,8 @@ async def lifespan(app: FastAPI):
         ON auth_sessions(user_id)
         """
     )
+
+    initialize_schema(conn)
 
     conn.execute(
         "UPDATE ScrapeJob SET data = json_set(data, '$.status', 'interrupted') "
@@ -701,15 +710,41 @@ async def network_status():
 
 # --- INTEGRATION ENDPOINTS ---
 @app.post("/api/apps/local/integration-endpoints/Core/UploadFile")
-async def upload_file(file: UploadFile = File(...)):
-    safe_filename = os.path.basename(file.filename) if file.filename else f"{uuid.uuid4()}.pdf"
-    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: CurrentUser = CurrentUserDep,
+):
+    conn = get_db()
+
     try:
-        content = await file.read()
-        with open(file_path, "wb") as buffer: buffer.write(content)
-        return {"file_url": file_path, "filename": safe_filename}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+
+        stored_file = store_pdf(
+            conn,
+            user_id=current_user.id,
+            filename=file.filename,
+            content_type=file.content_type,
+            content=content,
+        )
+
+        return {
+            "file_id": stored_file.file_id,
+            "file_url": file_reference(stored_file.file_id),
+            "filename": stored_file.original_filename,
+            "stored_filename": stored_file.storage_path.name,
+            "content_type": stored_file.content_type,
+            "size_bytes": stored_file.size_bytes,
+        }
+
+    except HTTPException:
+        raise
+    except OSError:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not store uploaded file.",
+        )
+    finally:
+        conn.close()
 
 
 
@@ -1093,14 +1128,25 @@ async def invoke_llm(
         raise HTTPException(status_code=400, detail="Missing 'prompt' in request body.")
 
     file_text = ""
-    for file_url in file_urls:
-        candidate_paths = [file_url, os.path.join(UPLOAD_DIR, os.path.basename(file_url))]
-        for path in candidate_paths:
-            if os.path.exists(path):
-                extraction_result = extract_text_from_pdf(path)
-                if extraction_result["success"]:
-                    file_text += "\n\n" + extraction_result["text"]
-                break
+    conn = get_db()
+
+    try:
+        for file_reference_value in file_urls:
+            stored_file = get_owned_file(
+                conn,
+                user_id=current_user.id,
+                file_reference=file_reference_value,
+            )
+
+            extraction_result = extract_text_from_pdf(
+                str(stored_file.storage_path)
+            )
+
+            if extraction_result["success"]:
+                file_text += "\n\n" + extraction_result["text"]
+
+    finally:
+        conn.close()
 
     schema_instruction = ""
     if response_schema:

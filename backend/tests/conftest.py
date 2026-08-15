@@ -6,13 +6,23 @@ jobhunter_pro.db, so the test suite cannot modify or delete real application
 data.
 """
 
+from __future__ import annotations
+
 import os
+import sqlite3
 import sys
 import tempfile
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    ),
+)
 
 
 @pytest.fixture
@@ -23,21 +33,24 @@ def temp_db_path(monkeypatch):
     os.close(fd)
 
     import main as app_module
+    from file_storage import initialize_schema
 
     def fake_get_db():
-        import sqlite3
-
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
-    monkeypatch.setattr(app_module, "get_db", fake_get_db)
+    monkeypatch.setattr(
+        app_module,
+        "get_db",
+        fake_get_db,
+    )
 
     conn = fake_get_db()
 
-    # Existing application tables
+    # Existing application tables.
     for entity in [
         "Resume",
         "Job",
@@ -49,11 +62,15 @@ def temp_db_path(monkeypatch):
         "Notification",
     ]:
         conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {entity} "
-            "(id TEXT PRIMARY KEY, data TEXT)"
+            f"""
+            CREATE TABLE IF NOT EXISTS {entity} (
+                id TEXT PRIMARY KEY,
+                data TEXT
+            )
+            """
         )
 
-    # Authentication tables
+    # Authentication tables.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -96,6 +113,12 @@ def temp_db_path(monkeypatch):
         ON auth_sessions(user_id)
         """
     )
+
+    # File-storage metadata tables.
+    #
+    # This uses the same schema initializer as the application so the
+    # temporary test database stays aligned with production schema.
+    initialize_schema(conn)
 
     conn.commit()
     conn.close()
