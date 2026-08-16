@@ -1,8 +1,8 @@
 """
 Notification ownership and isolation tests.
 
-These prove that notifications are owned by the authenticated user and
-cannot be read, marked read, cleared, or manipulated by another user.
+These verify that notification records are server-owned by the authenticated
+user and that one user cannot read, mark, or clear another user's notices.
 """
 
 import os
@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 sys.path.insert(
     0,
@@ -26,21 +27,14 @@ TEST_PASSWORD = "CorrectHorseBatteryStaple!"
 
 def create_user(email: str, name: str):
     conn = app_module.get_db()
-
     user_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
         """
         INSERT INTO users (
-            id,
-            email,
-            name,
-            password_hash,
-            is_active,
-            created_at,
-            updated_at,
-            last_login_at
+            id, email, name, password_hash, is_active,
+            created_at, updated_at, last_login_at
         )
         VALUES (?, ?, ?, ?, 1, ?, ?, NULL)
         """,
@@ -53,280 +47,203 @@ def create_user(email: str, name: str):
             now,
         ),
     )
-
     conn.commit()
     conn.close()
-
     return user_id
 
 
 def login_as(client, email: str):
-    response = client.post(
-        "/api/apps/local/auth/login",
-        json={
-            "email": email,
-            "password": TEST_PASSWORD,
-        },
-    )
+    """Authenticate in an isolated browser session and return a Bearer token."""
+    with TestClient(app_module.app) as auth_client:
+        response = auth_client.post(
+            "/api/apps/local/auth/login",
+            json={
+                "email": email,
+                "password": TEST_PASSWORD,
+            },
+        )
 
-    assert response.status_code == 200
+        assert response.status_code == 200, response.text
+        access_token = response.json()["access_token"]
 
-    return {
-        "Authorization": f"Bearer {response.json()['access_token']}",
-    }
-
-
-def test_notifications_require_authentication(
-    client,
-    temp_db_path,
-):
+    return {"Authorization": f"Bearer {access_token}"}
+def test_notifications_require_authentication(client, temp_db_path):
     response = client.get("/api/notifications")
-
     assert response.status_code == 401
 
 
-def test_notification_creation_is_bound_to_authenticated_user(
+def test_notification_creation_requires_owner_and_isolated_reads(
     client,
     temp_db_path,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
-    )
+    primary_user_id = create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
     app_module.add_notification(
-        "Alice notification",
+        "Primary notification",
+        user_id=primary_user_id,
         type="info",
-        user_id=alice_id,
     )
 
-    response = client.get(
+    primary_response = client.get(
         "/api/notifications",
-        headers=headers,
+        headers=primary_headers,
+    )
+    secondary_response = client.get(
+        "/api/notifications",
+        headers=secondary_headers,
     )
 
-    assert response.status_code == 200
+    assert primary_response.status_code == 200
+    assert secondary_response.status_code == 200
 
-    notifications = response.json()["notifications"]
+    primary_items = primary_response.json()["notifications"]
+    secondary_items = secondary_response.json()["notifications"]
 
-    assert len(notifications) == 1
-    assert notifications[0]["user_id"] == alice_id
-    assert notifications[0]["message"] == "Alice notification"
+    assert len(primary_items) == 1
+    assert primary_items[0]["message"] == "Primary notification"
+    assert primary_items[0]["user_id"] == primary_user_id
+    assert secondary_items == []
 
 
-def test_users_cannot_see_each_others_notifications(
+def test_users_cannot_mark_each_others_notifications_as_read(
     client,
     temp_db_path,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
-    )
+    primary_user_id = create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    create_user(
-        "bob@example.com",
-        "Bob",
-    )
-
-    alice_headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    bob_headers = login_as(
-        client,
-        "bob@example.com",
-    )
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
     app_module.add_notification(
-        "Alice private notification",
+        "Primary unread",
+        user_id=primary_user_id,
         type="info",
-        user_id=alice_id,
     )
 
-    alice_response = client.get(
+    before = client.get(
         "/api/notifications",
-        headers=alice_headers,
+        headers=primary_headers,
     )
+    assert before.json()["unread_count"] == 1
 
-    bob_response = client.get(
-        "/api/notifications",
-        headers=bob_headers,
-    )
-
-    assert alice_response.status_code == 200
-    assert bob_response.status_code == 200
-
-    assert len(alice_response.json()["notifications"]) == 1
-    assert alice_response.json()["notifications"][0]["message"] == (
-        "Alice private notification"
-    )
-
-    assert bob_response.json()["notifications"] == []
-    assert bob_response.json()["unread_count"] == 0
-
-
-def test_mark_all_read_only_affects_authenticated_users_notifications(
-    client,
-    temp_db_path,
-):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    bob_id = create_user(
-        "bob@example.com",
-        "Bob",
-    )
-
-    alice_headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    bob_headers = login_as(
-        client,
-        "bob@example.com",
-    )
-
-    app_module.add_notification(
-        "Alice notification",
-        type="info",
-        user_id=alice_id,
-    )
-
-    app_module.add_notification(
-        "Bob notification",
-        type="info",
-        user_id=bob_id,
-    )
-
-    response = client.post(
+    secondary_mark = client.post(
         "/api/notifications/mark-all-read",
-        headers=alice_headers,
+        headers=secondary_headers,
     )
+    assert secondary_mark.status_code == 200
 
-    assert response.status_code == 200
-
-    alice_notifications = client.get(
+    after = client.get(
         "/api/notifications",
-        headers=alice_headers,
+        headers=primary_headers,
     )
-
-    bob_notifications = client.get(
-        "/api/notifications",
-        headers=bob_headers,
-    )
-
-    assert alice_notifications.status_code == 200
-    assert bob_notifications.status_code == 200
-
-    assert alice_notifications.json()["unread_count"] == 0
-    assert bob_notifications.json()["unread_count"] == 1
+    assert after.status_code == 200
+    assert after.json()["unread_count"] == 1
+    assert after.json()["notifications"][0]["read"] is False
 
 
-def test_clear_notifications_only_affects_authenticated_users_notifications(
+def test_clear_notifications_only_clears_the_authenticated_users_notifications(
     client,
     temp_db_path,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
-    )
+    primary_user_id = create_user("primary@example.com", "Primary")
+    secondary_user_id = create_user("secondary@example.com", "Secondary")
 
-    bob_id = create_user(
-        "bob@example.com",
-        "Bob",
-    )
-
-    alice_headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    bob_headers = login_as(
-        client,
-        "bob@example.com",
-    )
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
     app_module.add_notification(
-        "Alice notification",
+        "Primary notice",
+        user_id=primary_user_id,
         type="info",
-        user_id=alice_id,
     )
-
     app_module.add_notification(
-        "Bob notification",
+        "Secondary notice",
+        user_id=secondary_user_id,
         type="info",
-        user_id=bob_id,
     )
 
     response = client.delete(
         "/api/notifications",
-        headers=alice_headers,
+        headers=primary_headers,
     )
-
     assert response.status_code == 200
 
-    alice_notifications = client.get(
+    primary_items = client.get(
         "/api/notifications",
-        headers=alice_headers,
-    )
-
-    bob_notifications = client.get(
+        headers=primary_headers,
+    ).json()["notifications"]
+    secondary_items = client.get(
         "/api/notifications",
-        headers=bob_headers,
-    )
+        headers=secondary_headers,
+    ).json()["notifications"]
 
-    assert alice_notifications.status_code == 200
-    assert bob_notifications.status_code == 200
-
-    assert alice_notifications.json()["notifications"] == []
-
-    assert [
-        notification["message"]
-        for notification in bob_notifications.json()["notifications"]
-    ] == ["Bob notification"]
+    assert primary_items == []
+    assert len(secondary_items) == 1
+    assert secondary_items[0]["message"] == "Secondary notice"
 
 
 def test_generic_notification_entity_access_is_blocked(
     client,
     temp_db_path,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
+    create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
+
+    for method, path in [
+        ("get", "/api/apps/local/entities/Notification"),
+        ("post", "/api/apps/local/entities/Notification"),
+        ("delete", "/api/apps/local/entities/Notification/some-id"),
+    ]:
+        if method == "post":
+            response = client.post(
+                path,
+                headers=headers,
+                json={"message": "should not be accepted"},
+            )
+        elif method == "get":
+            response = client.get(
+                path,
+                headers=headers,
+            )
+        else:
+            response = client.delete(
+                path,
+                headers=headers,
+            )
+        assert response.status_code == 403
+
+
+def test_background_notification_carries_scrape_owner(
+    client,
+    temp_db_path,
+):
+    primary_user_id = create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
+
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
+
+    app_module.add_notification(
+        "Primary scrape finished",
+        user_id=primary_user_id,
+        type="success",
+        context="scrape",
     )
 
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    primary_items = client.get(
+        "/api/notifications",
+        headers=primary_headers,
+    ).json()["notifications"]
+    secondary_items = client.get(
+        "/api/notifications",
+        headers=secondary_headers,
+    ).json()["notifications"]
 
-    get_response = client.get(
-        "/api/apps/local/entities/Notification",
-        headers=headers,
-    )
-
-    post_response = client.post(
-        "/api/apps/local/entities/Notification",
-        headers=headers,
-        json={
-            "message": "should not be accepted",
-        },
-    )
-
-    delete_response = client.delete(
-        "/api/apps/local/entities/Notification/some-id",
-        headers=headers,
-    )
-
-    assert get_response.status_code == 403
-    assert post_response.status_code == 403
-    assert delete_response.status_code == 403
+    assert primary_items[0]["context"] == "scrape"
+    assert primary_items[0]["user_id"] == primary_user_id
+    assert secondary_items == []

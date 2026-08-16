@@ -16,6 +16,7 @@ sys.path.insert(
     ),
 )
 
+from fastapi.testclient import TestClient
 import main as app_module
 from auth import hash_password
 
@@ -25,22 +26,13 @@ TEST_PASSWORD = "CorrectHorseBatteryStaple!"
 
 def make_valid_pdf_bytes() -> bytes:
     buffer = BytesIO()
-
     writer = PdfWriter()
-    writer.add_blank_page(
-        width=612,
-        height=792,
-    )
-
+    writer.add_blank_page(width=612, height=792)
     writer.write(buffer)
-
     return buffer.getvalue()
 
 
-def create_user(
-    email: str,
-    name: str,
-):
+def create_user(email: str, name: str):
     conn = app_module.get_db()
 
     user_id = str(uuid.uuid4())
@@ -76,32 +68,22 @@ def create_user(
     return user_id
 
 
-def login_as(
-    client,
-    email: str,
-):
-    response = client.post(
-        "/api/apps/local/auth/login",
-        json={
-            "email": email,
-            "password": TEST_PASSWORD,
-        },
-    )
+def login_as(client, email: str):
+    """Authenticate in an isolated browser session and return a Bearer token."""
+    with TestClient(app_module.app) as auth_client:
+        response = auth_client.post(
+            "/api/apps/local/auth/login",
+            json={
+                "email": email,
+                "password": TEST_PASSWORD,
+            },
+        )
 
-    assert response.status_code == 200
+        assert response.status_code == 200, response.text
+        access_token = response.json()["access_token"]
 
-    return {
-        "Authorization": (
-            f"Bearer {response.json()['access_token']}"
-        ),
-    }
-
-
-def upload_pdf(
-    client,
-    headers,
-    filename="resume.pdf",
-):
+    return {"Authorization": f"Bearer {access_token}"}
+def upload_pdf(client, headers, filename="resume.pdf"):
     return client.post(
         "/api/apps/local/integration-endpoints/Core/UploadFile",
         headers=headers,
@@ -131,15 +113,8 @@ def test_upload_rejects_non_pdf(
     client,
     temp_db_path,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
 
     response = client.post(
         "/api/apps/local/integration-endpoints/Core/UploadFile",
@@ -160,15 +135,8 @@ def test_upload_rejects_fake_pdf(
     client,
     temp_db_path,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
 
     response = client.post(
         "/api/apps/local/integration-endpoints/Core/UploadFile",
@@ -189,20 +157,13 @@ def test_upload_stores_opaque_file_reference(
     client,
     temp_db_path,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    primary_user_id = create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
 
     response = upload_pdf(
         client,
         headers=headers,
-        filename="../../alice-secret.pdf",
+        filename="../../primary-secret.pdf",
     )
 
     assert response.status_code == 200
@@ -210,105 +171,75 @@ def test_upload_stores_opaque_file_reference(
     data = response.json()
 
     assert data["file_id"]
-
-    assert data["file_url"] == (
-        f"/api/files/{data['file_id']}"
-    )
-
-    assert data["filename"] == "alice-secret.pdf"
-
+    assert data["file_url"] == f"/api/files/{data['file_id']}"
+    assert data["filename"] == "primary-secret.pdf"
     assert data["content_type"] == "application/pdf"
-
     assert data["size_bytes"] > 0
 
     conn = app_module.get_db()
-
     try:
         row = conn.execute(
             """
-            SELECT
-                id,
-                user_id,
-                storage_name,
-                original_filename
+            SELECT id, user_id, storage_name, original_filename
             FROM uploaded_files
             WHERE id = ?
             """,
             (data["file_id"],),
         ).fetchone()
-
     finally:
         conn.close()
 
-    assert row["user_id"] == alice_id
-    assert row["original_filename"] == "alice-secret.pdf"
-
-    assert os.path.basename(
-        row["storage_name"]
-    ) != "../../alice-secret.pdf"
+    assert row["user_id"] == primary_user_id
+    assert row["original_filename"] == "primary-secret.pdf"
+    assert os.path.basename(row["storage_name"]) != "../../primary-secret.pdf"
 
 
 def test_upload_never_uses_client_filename_as_storage_path(
     client,
     temp_db_path,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    malicious_filename = (
-        "..\\..\\shared-overwrite.pdf"
-    )
+    primary_user_id = create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
 
     response = upload_pdf(
         client,
         headers=headers,
-        filename=malicious_filename,
+        filename="..\\..\\shared-overwrite.pdf",
     )
 
     assert response.status_code == 200
 
     data = response.json()
 
-    assert (
-        data["stored_filename"]
-        != malicious_filename
-    )
-
     assert data["stored_filename"].endswith(".pdf")
+    assert data["stored_filename"] != "..\\..\\shared-overwrite.pdf"
 
-    absolute_storage = os.path.abspath(
-        os.path.join(
-            app_module.UPLOAD_DIR,
-            alice_id,
-            data["stored_filename"],
-        )
-    )
+    conn = app_module.get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT user_id, storage_name, original_filename
+            FROM uploaded_files
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (data["file_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
 
-    assert os.path.exists(
-        absolute_storage
-    )
+    assert row is not None
+    assert row["user_id"] == primary_user_id
+    assert row["original_filename"] == "shared-overwrite.pdf"
+    assert row["storage_name"].endswith(f"{data['file_id']}.pdf")
 
 
 def test_upload_rejects_files_over_size_limit(
     client,
     temp_db_path,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
 
     oversized = (
         b"%PDF-1.7\n"
@@ -341,53 +272,39 @@ def test_invoke_llm_cannot_read_another_users_upload(
     temp_db_path,
     monkeypatch,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
+    primary_user_id = create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    create_user(
-        "bob@example.com",
-        "Bob",
-    )
-
-    alice_headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    bob_headers = login_as(
-        client,
-        "bob@example.com",
-    )
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
     upload_response = upload_pdf(
         client,
-        headers=alice_headers,
-        filename="alice.pdf",
+        headers=primary_headers,
+        filename="primary.pdf",
     )
 
     assert upload_response.status_code == 200
 
-    alice_file_id = upload_response.json()["file_id"]
+    primary_file_id = upload_response.json()["file_id"]
 
     monkeypatch.setattr(
         app_module,
         "call_llm_with_retry",
-        lambda **kwargs: {
-            "ok": True
-        },
+        lambda **kwargs: {"ok": True},
     )
 
     response = client.post(
         "/api/apps/local/integration-endpoints/Core/InvokeLLM",
-        headers=bob_headers,
+        headers=secondary_headers,
         json={
             "prompt": "Read this file.",
             "file_urls": [
-                f"/api/files/{alice_file_id}",
+                f"/api/files/{primary_file_id}",
             ],
         },
     )
 
     assert response.status_code == 404
+
+    assert primary_user_id

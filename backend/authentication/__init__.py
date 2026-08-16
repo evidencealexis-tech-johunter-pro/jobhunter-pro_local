@@ -1,12 +1,5 @@
-"""Compatibility exports for the JobHunter Pro authentication package.
-
-The authentication implementation lives under ``authentication``. This module
-keeps the existing import surface stable while application modules migrate to
-the domain package directly.
-"""
-
-from authentication.models import CurrentUser
-from authentication.session import (
+from .models import CurrentUser
+from .session import (
     ACCESS_TOKEN_TTL_MINUTES,
     AUTH_COOKIE_MAX_AGE,
     AUTH_COOKIE_NAME,
@@ -15,7 +8,6 @@ from authentication.session import (
     CSRF_CONTEXT,
     CSRF_HEADER_NAME,
     SAFE_METHODS,
-    CurrentUserDep,
     clear_auth_cookie,
     csrf_token_for_session,
     enforce_csrf,
@@ -28,6 +20,7 @@ from authentication.session import (
     set_auth_cookie,
     utc_now,
     verify_password,
+    CurrentUserDep,
 )
 
 __all__ = [

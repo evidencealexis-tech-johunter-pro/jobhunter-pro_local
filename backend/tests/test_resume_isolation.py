@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 sys.path.insert(
     0,
@@ -62,23 +63,20 @@ def create_user(email: str, name: str):
 
 
 def login_as(client, email: str):
-    response = client.post(
-        "/api/apps/local/auth/login",
-        json={
-            "email": email,
-            "password": TEST_PASSWORD,
-        },
-    )
+    """Authenticate in an isolated browser session and return a Bearer token."""
+    with TestClient(app_module.app) as auth_client:
+        response = auth_client.post(
+            "/api/apps/local/auth/login",
+            json={
+                "email": email,
+                "password": TEST_PASSWORD,
+            },
+        )
 
-    assert response.status_code == 200
+        assert response.status_code == 200, response.text
+        access_token = response.json()["access_token"]
 
-    token = response.json()["access_token"]
-
-    return {
-        "Authorization": f"Bearer {token}",
-    }
-
-
+    return {"Authorization": f"Bearer {access_token}"}
 def create_resume(client, headers, **overrides):
     payload = {
         "file_name": "resume.pdf",
@@ -116,13 +114,13 @@ def test_resume_creation_binds_server_side_user_id(
     temp_db_path,
 ):
     create_user(
-        "alice@example.com",
-        "Alice",
+        "primary@example.com",
+        "Primary",
     )
 
     headers = login_as(
         client,
-        "alice@example.com",
+        "primary@example.com",
     )
 
     resume = create_resume(
@@ -153,51 +151,51 @@ def test_users_cannot_see_each_others_resumes(
     client,
     temp_db_path,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
+    primary_user_id = create_user(
+        "primary@example.com",
+        "Primary",
     )
 
     create_user(
-        "bob@example.com",
-        "Bob",
+        "secondary@example.com",
+        "Secondary",
     )
 
-    alice_headers = login_as(
+    primary_headers = login_as(
         client,
-        "alice@example.com",
+        "primary@example.com",
     )
 
-    bob_headers = login_as(
+    secondary_headers = login_as(
         client,
-        "bob@example.com",
+        "secondary@example.com",
     )
 
     resume = create_resume(
         client,
-        alice_headers,
-        file_name="alice.pdf",
+        primary_headers,
+        file_name="primary.pdf",
     )
 
-    alice_resumes = client.get(
+    primary_resumes = client.get(
         "/api/apps/local/entities/Resume",
-        headers=alice_headers,
+        headers=primary_headers,
     )
 
-    assert alice_resumes.status_code == 200
-    assert [r["id"] for r in alice_resumes.json()] == [resume["id"]]
+    assert primary_resumes.status_code == 200
+    assert [r["id"] for r in primary_resumes.json()] == [resume["id"]]
 
-    bob_resumes = client.get(
+    secondary_resumes = client.get(
         "/api/apps/local/entities/Resume",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
 
-    assert bob_resumes.status_code == 200
+    assert secondary_resumes.status_code == 200
     assert resume["id"] not in [
-        r["id"] for r in bob_resumes.json()
+        r["id"] for r in secondary_resumes.json()
     ]
 
-    assert alice_id == resume["user_id"]
+    assert primary_user_id == resume["user_id"]
 
 
 def test_users_cannot_update_each_others_resumes(
@@ -205,35 +203,35 @@ def test_users_cannot_update_each_others_resumes(
     temp_db_path,
 ):
     create_user(
-        "alice@example.com",
-        "Alice",
+        "primary@example.com",
+        "Primary",
     )
 
     create_user(
-        "bob@example.com",
-        "Bob",
+        "secondary@example.com",
+        "Secondary",
     )
 
-    alice_headers = login_as(
+    primary_headers = login_as(
         client,
-        "alice@example.com",
+        "primary@example.com",
     )
 
-    bob_headers = login_as(
+    secondary_headers = login_as(
         client,
-        "bob@example.com",
+        "secondary@example.com",
     )
 
     resume = create_resume(
         client,
-        alice_headers,
+        primary_headers,
     )
 
     response = client.patch(
         f"/api/apps/local/entities/Resume/{resume['id']}",
-        headers=bob_headers,
+        headers=secondary_headers,
         json={
-            "summary": "Bob should not be able to change this.",
+            "summary": "Secondary should not be able to change this.",
         },
     )
 
@@ -245,45 +243,45 @@ def test_users_cannot_delete_each_others_resumes(
     temp_db_path,
 ):
     create_user(
-        "alice@example.com",
-        "Alice",
+        "primary@example.com",
+        "Primary",
     )
 
     create_user(
-        "bob@example.com",
-        "Bob",
+        "secondary@example.com",
+        "Secondary",
     )
 
-    alice_headers = login_as(
+    primary_headers = login_as(
         client,
-        "alice@example.com",
+        "primary@example.com",
     )
 
-    bob_headers = login_as(
+    secondary_headers = login_as(
         client,
-        "bob@example.com",
+        "secondary@example.com",
     )
 
     resume = create_resume(
         client,
-        alice_headers,
+        primary_headers,
     )
 
     response = client.delete(
         f"/api/apps/local/entities/Resume/{resume['id']}",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
 
     assert response.status_code == 404
 
-    alice_view = client.get(
+    primary_view = client.get(
         "/api/apps/local/entities/Resume",
-        headers=alice_headers,
+        headers=primary_headers,
     )
 
-    assert alice_view.status_code == 200
+    assert primary_view.status_code == 200
     assert resume["id"] in [
-        r["id"] for r in alice_view.json()
+        r["id"] for r in primary_view.json()
     ]
 
 
@@ -293,41 +291,41 @@ async def test_scrape_uses_only_the_authenticated_users_active_resume(
     temp_db_path,
     monkeypatch,
 ):
-    alice_id = create_user(
-        "alice@example.com",
-        "Alice",
+    primary_user_id = create_user(
+        "primary@example.com",
+        "Primary",
     )
 
     create_user(
-        "bob@example.com",
-        "Bob",
+        "secondary@example.com",
+        "Secondary",
     )
 
-    alice_headers = login_as(
+    primary_headers = login_as(
         client,
-        "alice@example.com",
+        "primary@example.com",
     )
 
-    bob_headers = login_as(
+    secondary_headers = login_as(
         client,
-        "bob@example.com",
+        "secondary@example.com",
     )
 
     create_resume(
         client,
-        alice_headers,
-        file_name="alice.pdf",
-        skills=["ALICE_ONLY_SKILL"],
-        seniority="Alice Senior",
+        primary_headers,
+        file_name="primary.pdf",
+        skills=["PRIMARY_ONLY_SKILL"],
+        seniority="Primary Senior",
         years_exp=11,
     )
 
     create_resume(
         client,
-        bob_headers,
-        file_name="bob.pdf",
-        skills=["BOB_ONLY_SKILL"],
-        seniority="Bob Senior",
+        secondary_headers,
+        file_name="secondary.pdf",
+        skills=["SECONDARY_ONLY_SKILL"],
+        seniority="Secondary Senior",
         years_exp=22,
     )
 
@@ -387,7 +385,7 @@ async def test_scrape_uses_only_the_authenticated_users_active_resume(
 
     scrape_response = client.post(
         "/api/apps/local/integration-endpoints/Core/ScrapeJobs",
-        headers=alice_headers,
+        headers=primary_headers,
         json={
             "source_url": "https://example.com/jobs",
             "source_name": "Example",
@@ -399,24 +397,21 @@ async def test_scrape_uses_only_the_authenticated_users_active_resume(
 
     job_id = scrape_response.json()["job_id"]
 
+    # Let the created background task run to completion.
     for task in list(app_module.background_tasks):
         await task
 
     assert captured_prompts
 
-    alice_prompt = captured_prompts[0]["prompt"]
+    primary_prompt = captured_prompts[0]["prompt"]
 
-    assert captured_prompts[0]["user_id"] == alice_id
-
-    # Production normalizes resume skills to lowercase.
-    assert "alice_only_skill" in alice_prompt
-
-    assert "Alice Senior" in alice_prompt
-
-    assert "bob_only_skill" not in alice_prompt
-    assert "Bob Senior" not in alice_prompt
+    assert captured_prompts[0]["user_id"] == primary_user_id
+    assert "primary_only_skill" in primary_prompt
+    assert "Primary Senior" in primary_prompt
+    assert "secondary_only_skill" not in primary_prompt
+    assert "Secondary Senior" not in primary_prompt
 
     state = app_module.get_job_state(job_id)
 
     assert state is not None
-    assert state["user_id"] == alice_id
+    assert state["user_id"] == primary_user_id

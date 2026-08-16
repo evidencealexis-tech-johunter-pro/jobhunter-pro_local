@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 sys.path.insert(
     0,
@@ -54,16 +55,20 @@ def create_user(email: str, name: str):
 
 
 def login_as(client, email: str):
-    response = client.post(
-        "/api/apps/local/auth/login",
-        json={"email": email, "password": TEST_PASSWORD},
-    )
-    assert response.status_code == 200
-    return {
-        "Authorization": f"Bearer {response.json()['access_token']}"
-    }
+    """Authenticate in an isolated browser session and return a Bearer token."""
+    with TestClient(app_module.app) as auth_client:
+        response = auth_client.post(
+            "/api/apps/local/auth/login",
+            json={
+                "email": email,
+                "password": TEST_PASSWORD,
+            },
+        )
 
+        assert response.status_code == 200, response.text
+        access_token = response.json()["access_token"]
 
+    return {"Authorization": f"Bearer {access_token}"}
 def create_job(client, headers, **overrides):
     payload = {
         "title": "Python Engineer",
@@ -92,8 +97,8 @@ def test_job_creation_uses_authenticated_user_and_ignores_client_user_id(
     client,
     temp_db_path,
 ):
-    alice_id = create_user("alice@example.com", "Alice")
-    headers = login_as(client, "alice@example.com")
+    primary_user_id = create_user("primary@example.com", "Primary")
+    headers = login_as(client, "primary@example.com")
 
     job = create_job(
         client,
@@ -101,7 +106,7 @@ def test_job_creation_uses_authenticated_user_and_ignores_client_user_id(
         user_id="attacker-controlled-user-id",
     )
 
-    assert job["user_id"] == alice_id
+    assert job["user_id"] == primary_user_id
 
     conn = app_module.get_db()
     try:
@@ -113,117 +118,117 @@ def test_job_creation_uses_authenticated_user_and_ignores_client_user_id(
     finally:
         conn.close()
 
-    assert stored["user_id"] == alice_id
+    assert stored["user_id"] == primary_user_id
 
 
 def test_users_cannot_see_each_others_jobs(client, temp_db_path):
-    create_user("alice@example.com", "Alice")
-    create_user("bob@example.com", "Bob")
+    create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    alice_headers = login_as(client, "alice@example.com")
-    bob_headers = login_as(client, "bob@example.com")
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
-    alice_job = create_job(client, alice_headers, title="Alice Job")
-    bob_job = create_job(client, bob_headers, title="Bob Job")
+    primary_job = create_job(client, primary_headers, title="Primary Job")
+    secondary_job = create_job(client, secondary_headers, title="Secondary Job")
 
-    alice_jobs = client.get(
+    primary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=alice_headers,
+        headers=primary_headers,
     )
-    bob_jobs = client.get(
+    secondary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
 
-    assert alice_jobs.status_code == 200
-    assert bob_jobs.status_code == 200
+    assert primary_jobs.status_code == 200
+    assert secondary_jobs.status_code == 200
 
-    assert [j["id"] for j in alice_jobs.json()] == [alice_job["id"]]
-    assert [j["id"] for j in bob_jobs.json()] == [bob_job["id"]]
+    assert [j["id"] for j in primary_jobs.json()] == [primary_job["id"]]
+    assert [j["id"] for j in secondary_jobs.json()] == [secondary_job["id"]]
 
 
 def test_users_cannot_update_each_others_jobs(client, temp_db_path):
-    create_user("alice@example.com", "Alice")
-    create_user("bob@example.com", "Bob")
+    create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    alice_headers = login_as(client, "alice@example.com")
-    bob_headers = login_as(client, "bob@example.com")
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
-    alice_job = create_job(client, alice_headers)
+    primary_job = create_job(client, primary_headers)
 
     response = client.patch(
-        f"/api/apps/local/entities/Job/{alice_job['id']}",
-        headers=bob_headers,
-        json={"title": "Bob Took It"},
+        f"/api/apps/local/entities/Job/{primary_job['id']}",
+        headers=secondary_headers,
+        json={"title": "Secondary Took It"},
     )
 
     assert response.status_code == 404
 
-    alice_jobs = client.get(
+    primary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=alice_headers,
+        headers=primary_headers,
     )
-    assert alice_jobs.status_code == 200
-    assert alice_jobs.json()[0]["title"] == "Python Engineer"
+    assert primary_jobs.status_code == 200
+    assert primary_jobs.json()[0]["title"] == "Python Engineer"
 
 
 def test_users_cannot_delete_each_others_jobs(client, temp_db_path):
-    create_user("alice@example.com", "Alice")
-    create_user("bob@example.com", "Bob")
+    create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    alice_headers = login_as(client, "alice@example.com")
-    bob_headers = login_as(client, "bob@example.com")
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
-    alice_job = create_job(client, alice_headers)
+    primary_job = create_job(client, primary_headers)
 
     response = client.delete(
-        f"/api/apps/local/entities/Job/{alice_job['id']}",
-        headers=bob_headers,
+        f"/api/apps/local/entities/Job/{primary_job['id']}",
+        headers=secondary_headers,
     )
 
     assert response.status_code == 404
 
-    alice_jobs = client.get(
+    primary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=alice_headers,
+        headers=primary_headers,
     )
-    assert alice_job["id"] in [j["id"] for j in alice_jobs.json()]
+    assert primary_job["id"] in [j["id"] for j in primary_jobs.json()]
 
 
 def test_clear_all_only_deletes_the_authenticated_users_jobs(
     client,
     temp_db_path,
 ):
-    create_user("alice@example.com", "Alice")
-    create_user("bob@example.com", "Bob")
+    create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    alice_headers = login_as(client, "alice@example.com")
-    bob_headers = login_as(client, "bob@example.com")
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
-    alice_job = create_job(client, alice_headers, title="Alice Job")
-    bob_job = create_job(client, bob_headers, title="Bob Job")
+    primary_job = create_job(client, primary_headers, title="Primary Job")
+    secondary_job = create_job(client, secondary_headers, title="Secondary Job")
 
     response = client.delete(
         "/api/apps/local/entities/Job/clear-all",
-        headers=alice_headers,
+        headers=primary_headers,
     )
 
     assert response.status_code == 200
 
-    alice_jobs = client.get(
+    primary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=alice_headers,
+        headers=primary_headers,
     )
-    bob_jobs = client.get(
+    secondary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
 
-    assert alice_jobs.status_code == 200
-    assert bob_jobs.status_code == 200
-    assert alice_jobs.json() == []
-    assert [j["id"] for j in bob_jobs.json()] == [bob_job["id"]]
-    assert alice_job["id"] != bob_job["id"]
+    assert primary_jobs.status_code == 200
+    assert secondary_jobs.status_code == 200
+    assert primary_jobs.json() == []
+    assert [j["id"] for j in secondary_jobs.json()] == [secondary_job["id"]]
+    assert primary_job["id"] != secondary_job["id"]
 
 
 @pytest.mark.asyncio
@@ -232,16 +237,16 @@ async def test_scrape_deduplication_is_scoped_to_the_authenticated_user(
     temp_db_path,
     monkeypatch,
 ):
-    alice_id = create_user("alice@example.com", "Alice")
-    bob_id = create_user("bob@example.com", "Bob")
+    primary_user_id = create_user("primary@example.com", "Primary")
+    secondary_user_id = create_user("secondary@example.com", "Secondary")
 
-    alice_headers = login_as(client, "alice@example.com")
-    bob_headers = login_as(client, "bob@example.com")
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
     # Each user needs an active resume for the scrape engine.
     for headers, skill in [
-        (alice_headers, "ALICE_SKILL"),
-        (bob_headers, "BOB_SKILL"),
+        (primary_headers, "PRIMARY_SKILL"),
+        (secondary_headers, "SECONDARY_SKILL"),
     ]:
         response = client.post(
             "/api/apps/local/entities/Resume",
@@ -256,16 +261,16 @@ async def test_scrape_deduplication_is_scoped_to_the_authenticated_user(
         )
         assert response.status_code == 200
 
-    # Give Alice an existing job with the same dedup hash.
+    # Give Primary an existing job with the same dedup hash.
     shared_hash = "same-job-hash-for-two-users"
-    alice_job = create_job(
+    primary_job = create_job(
         client,
-        alice_headers,
+        primary_headers,
         dedup_hash=shared_hash,
-        title="Alice Existing Job",
+        title="Primary Existing Job",
     )
 
-    # Bob should still be able to save a job with Alice's same hash because
+    # Secondary should still be able to save a job with Primary's same hash because
     # deduplication is an ownership concern, not a global application concern.
     captured_users = []
 
@@ -310,7 +315,7 @@ async def test_scrape_deduplication_is_scoped_to_the_authenticated_user(
 
     response = client.post(
         "/api/apps/local/integration-endpoints/Core/ScrapeJobs",
-        headers=bob_headers,
+        headers=secondary_headers,
         json={
             "source_url": "https://example.com/jobs",
             "source_name": "Example",
@@ -324,26 +329,26 @@ async def test_scrape_deduplication_is_scoped_to_the_authenticated_user(
     for task in list(app_module.background_tasks):
         await task
 
-    assert captured_users == [bob_id]
+    assert captured_users == [secondary_user_id]
 
-    bob_jobs = client.get(
+    secondary_jobs = client.get(
         "/api/apps/local/entities/Job",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
 
-    assert bob_jobs.status_code == 200
-    bob_job_ids = [j["id"] for j in bob_jobs.json()]
-    assert any(job_id != alice_job["id"] for job_id in bob_job_ids)
+    assert secondary_jobs.status_code == 200
+    secondary_job_ids = [j["id"] for j in secondary_jobs.json()]
+    assert any(job_id != primary_job["id"] for job_id in secondary_job_ids)
 
-    bob_created = [
-        j for j in bob_jobs.json()
-        if j["id"] != alice_job["id"]
+    secondary_created = [
+        j for j in secondary_jobs.json()
+        if j["id"] != primary_job["id"]
     ]
-    assert any(j.get("dedup_hash") == shared_hash for j in bob_created)
+    assert any(j.get("dedup_hash") == shared_hash for j in secondary_created)
 
-    state = app_module.get_job_state(scrape_job_id, bob_id)
+    state = app_module.get_job_state(scrape_job_id, secondary_user_id)
     assert state is not None
-    assert state["user_id"] == bob_id
+    assert state["user_id"] == secondary_user_id
 
 
 @pytest.mark.asyncio
@@ -352,11 +357,11 @@ async def test_user_cannot_read_or_stop_another_users_scrape_job(
     temp_db_path,
     monkeypatch,
 ):
-    create_user("alice@example.com", "Alice")
-    create_user("bob@example.com", "Bob")
+    create_user("primary@example.com", "Primary")
+    create_user("secondary@example.com", "Secondary")
 
-    alice_headers = login_as(client, "alice@example.com")
-    bob_headers = login_as(client, "bob@example.com")
+    primary_headers = login_as(client, "primary@example.com")
+    secondary_headers = login_as(client, "secondary@example.com")
 
     # Avoid requiring a real external scrape. Keep the task running long enough
     # for the ownership checks to happen.
@@ -367,7 +372,7 @@ async def test_user_cannot_read_or_stop_another_users_scrape_job(
 
     response = client.post(
         "/api/apps/local/integration-endpoints/Core/ScrapeJobs",
-        headers=alice_headers,
+        headers=primary_headers,
         json={
             "source_url": "https://example.com/jobs",
             "source_name": "Example",
@@ -380,21 +385,21 @@ async def test_user_cannot_read_or_stop_another_users_scrape_job(
     for task in list(app_module.background_tasks):
         await task
 
-    bob_status = client.get(
+    secondary_status = client.get(
         f"/api/apps/local/integration-endpoints/Core/ScrapeJobs/{job_id}/status",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
-    assert bob_status.status_code == 404
+    assert secondary_status.status_code == 404
 
-    bob_stop = client.post(
+    secondary_stop = client.post(
         f"/api/apps/local/integration-endpoints/Core/ScrapeJobs/{job_id}/stop",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
-    assert bob_stop.status_code == 404
+    assert secondary_stop.status_code == 404
 
-    bob_current = client.get(
+    secondary_current = client.get(
         "/api/apps/local/integration-endpoints/Core/ScrapeJobs/current",
-        headers=bob_headers,
+        headers=secondary_headers,
     )
-    assert bob_current.status_code == 200
-    assert bob_current.json()["job_id"] is None
+    assert secondary_current.status_code == 200
+    assert secondary_current.json()["job_id"] is None

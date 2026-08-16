@@ -7,10 +7,6 @@ from threading import Lock
 REMOTE_CONFIG_URL = os.getenv("REMOTE_CONFIG_URL", "")
 CACHE_TTL = 3600  # 1 hour
 
-# This whole block is the ONLY place provider info lives right now.
-# Later, if you want changes to reach already-installed copies of the
-# app without a reinstall, you host this same structure as a JSON file
-# on your own server and point REMOTE_CONFIG_URL at it.
 FALLBACK = {
     "provider_prefixes": {
         "sk-ant": "anthropic",
@@ -18,25 +14,26 @@ FALLBACK = {
         "sk-": "openai",
         "xai-": "grok",
         "AIza": "gemini",
+        "ds-": "deepseek",
     },
     "default_models": {
         "gemini": "gemini/gemini-3.5-flash-lite",
         "openai": "openai/gpt-4o-mini",
         "anthropic": "anthropic/claude-3-haiku-20240307",
-        "grok": "xai/grok-4.3",   # confirmed current flagship - double check
-                                  # against xAI's docs before changing this
+        "grok": "xai/grok-4.3",
         "local": "ollama/phi3:mini",
+        "deepseek": "deepseek/deepseek-chat",  # ← added
     },
-    
     "providers": [
         {"id": "gemini",    "label": "Google Gemini",      "needs_base_url": False},
         {"id": "openai",    "label": "OpenAI",             "needs_base_url": False},
         {"id": "anthropic", "label": "Anthropic (Claude)", "needs_base_url": False},
         {"id": "grok",      "label": "xAI (Grok)",         "needs_base_url": False},
+        {"id": "deepseek",  "label": "DeepSeek",           "needs_base_url": False},
         {"id": "local",     "label": "Local (Ollama)",     "needs_base_url": False},
         {"id": "custom",    "label": "Other / Custom",     "needs_base_url": True},
     ],
-    "supported_providers": ["gemini", "openai", "anthropic", "grok", "local", "custom"],
+    "supported_providers": ["gemini", "openai", "anthropic", "grok", "deepseek", "local", "custom"],  # ← added deepseek
 }
 
 _config_cache = None

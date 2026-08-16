@@ -1,125 +1,78 @@
 """
-Tests for the user-scoped BYOK key flow.
+Tests for the authenticated BYOK flow.
 
-These tests verify that:
-1. BYOK requires authentication.
-2. Unsupported providers are rejected.
-3. A valid key is stored for the authenticated user.
-4. The selected user's key status is returned.
-5. A user can remove their own key.
-6. One user cannot see another user's key.
-7. One user cannot remove another user's key.
+These tests verify that API keys are owned by the authenticated user and that
+one user's key cannot be read, removed, or used by another user.
 """
-
 import os
 import sys
 import uuid
 from datetime import datetime, timezone
 
-sys.path.insert(
-    0,
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fastapi.testclient import TestClient
 import main as app_module
 from auth import hash_password
 
 
-TEST_PASSWORD = "CorrectHorseBatteryStaple!"
-
-
-def create_user(email: str, name: str):
+def create_user(email: str, password: str = "CorrectHorseBatteryStaple!"):
     conn = app_module.get_db()
-
     user_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
         """
         INSERT INTO users (
-            id,
-            email,
-            name,
-            password_hash,
-            is_active,
-            created_at,
-            updated_at,
-            last_login_at
+            id, email, name, password_hash, is_active,
+            created_at, updated_at, last_login_at
         )
         VALUES (?, ?, ?, ?, 1, ?, ?, NULL)
         """,
         (
             user_id,
             email,
-            name,
-            hash_password(TEST_PASSWORD),
+            email.split("@", 1)[0],
+            hash_password(password),
             now,
             now,
         ),
     )
-
     conn.commit()
     conn.close()
-
     return user_id
 
 
-def login_as(client, email: str):
-    response = client.post(
-        "/api/apps/local/auth/login",
-        json={
-            "email": email,
-            "password": TEST_PASSWORD,
-        },
-    )
-
-    assert response.status_code == 200
-
-    token = response.json()["access_token"]
-
-    return {
-        "Authorization": f"Bearer {token}",
-    }
+def login(client, email: str, password: str = "CorrectHorseBatteryStaple!"):
+    """Authenticate in an isolated browser session and return a Bearer token."""
+    with TestClient(app_module.app) as auth_client:
+        response = auth_client.post(
+            "/api/apps/local/auth/login",
+            json={"email": email, "password": password},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["access_token"]
+def auth_headers(token: str):
+    return {"Authorization": f"Bearer {token}"}
 
 
-def test_saving_a_key_requires_authentication(
-    client,
-    temp_db_path,
-):
-    response = client.post(
-        "/api/settings/api-key",
-        json={
-            "api_key": "sk-fake",
-            "provider": "not-a-real-provider",
-        },
-    )
-
+def test_byok_requires_authentication(client, temp_db_path):
+    response = client.get("/api/settings/api-key/status")
     assert response.status_code == 401
 
 
-def test_saving_a_key_for_unsupported_provider_is_rejected(
-    client,
-    temp_db_path,
-):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+def test_saving_a_key_for_unsupported_provider_is_rejected(client, temp_db_path):
+    create_user("user@example.com")
+    token = login(client, "user@example.com")
 
     response = client.post(
         "/api/settings/api-key",
-        headers=headers,
+        headers=auth_headers(token),
         json={
             "api_key": "sk-fake",
             "provider": "not-a-real-provider",
         },
     )
-
     assert response.status_code == 400
 
 
@@ -128,25 +81,14 @@ def test_saving_a_valid_key_succeeds_and_does_not_freeze_default_model(
     temp_db_path,
     monkeypatch,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
+    create_user("user@example.com")
+    token = login(client, "user@example.com")
 
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    monkeypatch.setattr(
-        app_module.litellm,
-        "completion",
-        lambda **kwargs: None,
-    )
+    monkeypatch.setattr(app_module.litellm, "completion", lambda **kwargs: None)
 
     response = client.post(
         "/api/settings/api-key",
-        headers=headers,
+        headers=auth_headers(token),
         json={
             "api_key": "sk-fake-key-1234",
             "provider": "openai",
@@ -158,48 +100,30 @@ def test_saving_a_valid_key_succeeds_and_does_not_freeze_default_model(
 
     status = client.get(
         "/api/settings/api-key/status",
-        headers=headers,
-    )
+        headers=auth_headers(token),
+    ).json()
 
-    assert status.status_code == 200
-
-    data = status.json()
-
-    assert data["active"] is True
-    assert data["provider"] == "openai"
-
-    assert data["model"] == app_module.load_config()[
-        "default_models"
-    ]["openai"]
+    assert status["active"] is True
+    assert status["provider"] == "openai"
+    assert status["model"] == app_module.load_config()["default_models"]["openai"]
 
 
-def test_a_rejected_key_returns_a_clear_error_not_a_generic_500(
+def test_a_rejected_key_returns_clear_error_not_generic_500(
     client,
     temp_db_path,
     monkeypatch,
 ):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    create_user("user@example.com")
+    token = login(client, "user@example.com")
 
     def fake_completion_fails(**kwargs):
         raise Exception("Incorrect API key provided")
 
-    monkeypatch.setattr(
-        app_module.litellm,
-        "completion",
-        fake_completion_fails,
-    )
+    monkeypatch.setattr(app_module.litellm, "completion", fake_completion_fails)
 
     response = client.post(
         "/api/settings/api-key",
-        headers=headers,
+        headers=auth_headers(token),
         json={
             "api_key": "sk-bad-key",
             "provider": "openai",
@@ -210,175 +134,100 @@ def test_a_rejected_key_returns_a_clear_error_not_a_generic_500(
     assert "openai" in response.json()["detail"].lower()
 
 
-def test_removing_a_key_makes_status_inactive(
-    client,
-    temp_db_path,
-    monkeypatch,
-):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
+def test_removing_a_key_makes_status_inactive(client, temp_db_path, monkeypatch):
+    create_user("user@example.com")
+    token = login(client, "user@example.com")
 
-    headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    monkeypatch.setattr(app_module.litellm, "completion", lambda **kwargs: None)
 
-    monkeypatch.setattr(
-        app_module.litellm,
-        "completion",
-        lambda **kwargs: None,
-    )
-
-    save_response = client.post(
+    client.post(
         "/api/settings/api-key",
-        headers=headers,
-        json={
-            "api_key": "sk-fake",
-            "provider": "openai",
-        },
+        headers=auth_headers(token),
+        json={"api_key": "sk-fake", "provider": "openai"},
     )
 
-    assert save_response.status_code == 200
-
-    before = client.get(
+    assert client.get(
         "/api/settings/api-key/status",
-        headers=headers,
-    )
+        headers=auth_headers(token),
+    ).json()["active"] is True
 
-    assert before.status_code == 200
-    assert before.json()["active"] is True
-
-    remove_response = client.delete(
+    response = client.delete(
         "/api/settings/api-key",
-        headers=headers,
+        headers=auth_headers(token),
     )
-
-    assert remove_response.status_code == 200
-
-    after = client.get(
-        "/api/settings/api-key/status",
-        headers=headers,
-    )
-
-    assert after.status_code == 200
-    assert after.json()["active"] is False
-
-
-def test_users_cannot_see_each_others_api_keys(
-    client,
-    temp_db_path,
-    monkeypatch,
-):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
-
-    create_user(
-        "bob@example.com",
-        "Bob",
-    )
-
-    alice_headers = login_as(
-        client,
-        "alice@example.com",
-    )
-
-    bob_headers = login_as(
-        client,
-        "bob@example.com",
-    )
-
-    monkeypatch.setattr(
-        app_module.litellm,
-        "completion",
-        lambda **kwargs: None,
-    )
-
-    response = client.post(
-        "/api/settings/api-key",
-        headers=alice_headers,
-        json={
-            "api_key": "alice-secret-key-1234",
-            "provider": "openai",
-        },
-    )
-
     assert response.status_code == 200
 
-    alice_status = client.get(
+    assert client.get(
         "/api/settings/api-key/status",
-        headers=alice_headers,
-    )
-
-    assert alice_status.status_code == 200
-    assert alice_status.json()["active"] is True
-    assert alice_status.json()["key_suffix"] == "1234"
-
-    bob_status = client.get(
-        "/api/settings/api-key/status",
-        headers=bob_headers,
-    )
-
-    assert bob_status.status_code == 200
-    assert bob_status.json()["active"] is False
+        headers=auth_headers(token),
+    ).json()["active"] is False
 
 
-def test_users_cannot_remove_each_others_api_keys(
-    client,
-    temp_db_path,
-    monkeypatch,
-):
-    create_user(
-        "alice@example.com",
-        "Alice",
-    )
+def test_users_cannot_see_each_others_keys(client, temp_db_path, monkeypatch):
+    create_user("primary@example.com")
+    create_user("secondary@example.com")
 
-    create_user(
-        "bob@example.com",
-        "Bob",
-    )
+    primary_token = login(client, "primary@example.com")
+    secondary_token = login(client, "secondary@example.com")
 
-    alice_headers = login_as(
-        client,
-        "alice@example.com",
-    )
+    monkeypatch.setattr(app_module.litellm, "completion", lambda **kwargs: None)
 
-    bob_headers = login_as(
-        client,
-        "bob@example.com",
-    )
-
-    monkeypatch.setattr(
-        app_module.litellm,
-        "completion",
-        lambda **kwargs: None,
-    )
-
-    save_response = client.post(
+    saved = client.post(
         "/api/settings/api-key",
-        headers=alice_headers,
-        json={
-            "api_key": "alice-secret-key-1234",
-            "provider": "openai",
-        },
+        headers=auth_headers(primary_token),
+        json={"api_key": "sk-primary-1234", "provider": "openai"},
     )
+    assert saved.status_code == 200
 
-    assert save_response.status_code == 200
-
-    bob_remove = client.delete(
-        "/api/settings/api-key",
-        headers=bob_headers,
-    )
-
-    assert bob_remove.status_code == 404
-
-    alice_status = client.get(
+    primary_status = client.get(
         "/api/settings/api-key/status",
-        headers=alice_headers,
+        headers=auth_headers(primary_token),
+    ).json()
+    secondary_status = client.get(
+        "/api/settings/api-key/status",
+        headers=auth_headers(secondary_token),
+    ).json()
+
+    assert primary_status["active"] is True
+    assert primary_status["key_suffix"] == "1234"
+    assert secondary_status["active"] is False
+
+
+def test_one_user_cannot_remove_another_users_key(client, temp_db_path, monkeypatch):
+    create_user("primary@example.com")
+    create_user("secondary@example.com")
+
+    primary_token = login(client, "primary@example.com")
+    secondary_token = login(client, "secondary@example.com")
+
+    monkeypatch.setattr(app_module.litellm, "completion", lambda **kwargs: None)
+
+    client.post(
+        "/api/settings/api-key",
+        headers=auth_headers(primary_token),
+        json={"api_key": "sk-primary-1234", "provider": "openai"},
     )
 
-    assert alice_status.status_code == 200
-    assert alice_status.json()["active"] is True
+    response = client.delete(
+        "/api/settings/api-key",
+        headers=auth_headers(secondary_token),
+    )
+    assert response.status_code == 404
+
+    primary_status = client.get(
+        "/api/settings/api-key/status",
+        headers=auth_headers(primary_token),
+    ).json()
+    assert primary_status["active"] is True
+
+
+def test_generic_user_api_key_entity_access_is_blocked(client, temp_db_path):
+    create_user("user@example.com")
+    token = login(client, "user@example.com")
+
+    response = client.get(
+        "/api/apps/local/entities/UserApiKey",
+        headers=auth_headers(token),
+    )
+
+    assert response.status_code == 403
