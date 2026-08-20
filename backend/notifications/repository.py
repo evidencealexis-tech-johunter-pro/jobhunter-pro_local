@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 
-from core.database import get_db
+from core.database import get_db as core_get_db
+
+
+def _get_db():
+    main_module = sys.modules.get("main")
+    getter = getattr(main_module, "get_db", None) if main_module else None
+    return getter() if getter else core_get_db()
 
 
 def create_notification(
@@ -10,7 +17,7 @@ def create_notification(
     notification_id: str,
     data: dict,
 ) -> None:
-    conn = get_db()
+    conn = _get_db()
     try:
         conn.execute(
             "INSERT INTO Notification (id, data) VALUES (?, ?)",
@@ -25,7 +32,7 @@ def list_notifications(
     *,
     user_id: str,
 ) -> list[dict]:
-    conn = get_db()
+    conn = _get_db()
     try:
         rows = conn.execute(
             """
@@ -45,7 +52,7 @@ def mark_all_read(
     *,
     user_id: str,
 ) -> None:
-    conn = get_db()
+    conn = _get_db()
     try:
         rows = conn.execute(
             """
@@ -74,7 +81,7 @@ def delete_all(
     *,
     user_id: str,
 ) -> None:
-    conn = get_db()
+    conn = _get_db()
     try:
         conn.execute(
             """
