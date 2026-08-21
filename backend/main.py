@@ -5,15 +5,13 @@ import hmac
 import json
 import socket
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 import litellm
 from llm import service as llm_service
 from llm.schemas import InvokeLLMRequest
 from llm.service import invoke_llm
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 
@@ -27,21 +25,16 @@ from jobs.service import (
 from remote_config import load_config
 from scraper import detect_and_fetch
 
-from auth import (
+from authentication import (
     AUTH_COOKIE_NAME,
     CSRF_HEADER_NAME,
     SAFE_METHODS,
     CurrentUser,
     CurrentUserDep,
-    clear_auth_cookie,
     csrf_token_for_session,
-    get_request_session_token,
-    issue_access_token,
-    normalize_email,
-    revoke_token,
-    set_auth_cookie,
-    verify_password,
+    ensure_auth_schema,
 )
+from authentication.router import router as authentication_router
 from core.config import (
     ALLOWED_CORS_ORIGINS,
     APP_DEBUG,
@@ -109,6 +102,7 @@ async def lifespan(app: FastAPI):
 
     try:
         initialize_schema(conn)
+        ensure_auth_schema(conn)
         mark_running_jobs_interrupted(conn)
         conn.commit()
     finally:
@@ -131,6 +125,7 @@ if APP_DEBUG:
 # ROUTERS
 # ============================================================================
 
+app.include_router(authentication_router)
 app.include_router(jobs_router)
 app.include_router(entities_router)
 app.include_router(notifications_router)
@@ -264,151 +259,9 @@ app.add_middleware(
 
 
 # ============================================================================
-# AUTHENTICATION
-# ============================================================================
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-
-@app.post("/api/apps/local/auth/login")
-async def login(
-    body: LoginRequest,
-    response: Response,
-):
-    email = normalize_email(body.email)
-
-    if not email or not body.password:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password",
-        )
-
-    conn = get_db()
-
-    try:
-        user = conn.execute(
-            """
-            SELECT
-                id,
-                email,
-                name,
-                password_hash,
-                is_active
-            FROM users
-            WHERE email = ?
-            LIMIT 1
-            """,
-            (email,),
-        ).fetchone()
-
-        if not user or not verify_password(
-            body.password,
-            user["password_hash"],
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid email or password",
-            )
-
-        if not user["is_active"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Account is disabled",
-            )
-
-        now = datetime.now(timezone.utc).isoformat()
-        token = issue_access_token(
-            conn,
-            user["id"],
-        )
-
-        conn.execute(
-            """
-            UPDATE users
-            SET
-                last_login_at = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                now,
-                now,
-                user["id"],
-            ),
-        )
-
-        conn.commit()
-        set_auth_cookie(response, token)
-
-        return {
-            "access_token": token,
-            "token_type": "bearer",
-            "user": {
-                "id": user["id"],
-                "email": user["email"],
-                "name": user["name"],
-            },
-        }
-
-    finally:
-        conn.close()
-
-
-@app.post("/api/apps/auth/logout")
-async def logout(
-    request: Request,
-    response: Response,
-):
-    transport = get_request_session_token(request)
-
-    if transport:
-        token, _from_cookie = transport
-
-        conn = get_db()
-
-        try:
-            revoke_token(
-                conn,
-                token,
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    clear_auth_cookie(response)
-
-    return {
-        "message": "Logged out successfully",
-    }
-
-
-@app.get("/api/apps/local/auth/csrf")
-async def get_csrf_token(
-    request: Request,
-):
-    session_token = request.cookies.get(
-        AUTH_COOKIE_NAME
-    )
-
-    if not session_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Cookie authentication required",
-        )
-
-    return {
-        "csrf_token": csrf_token_for_session(
-            session_token
-        ),
-        "header_name": CSRF_HEADER_NAME,
-    }
-
-
-# ============================================================================
 # GENERIC ENTITY ROUTES
 #
+# Auth routes are owned by authentication.router.
 # Job routes are owned by jobs.router.
 # Notification routes are owned by notifications.router.
 # Upload routes are owned by uploads.router.

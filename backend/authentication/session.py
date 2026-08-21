@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -13,11 +13,23 @@ from fastapi import Depends, HTTPException, Request, Response, status
 
 from core import database
 
+from .models import CurrentUser
+
 
 ACCESS_TOKEN_TTL_MINUTES = 30
 AUTH_COOKIE_MAX_AGE = ACCESS_TOKEN_TTL_MINUTES * 60
 AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true"
 AUTH_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "lax").lower()
+
+# Per OWASP Forgot Password Cheat Sheet: short-lived, single-use reset tokens.
+PASSWORD_RESET_TOKEN_TTL_MINUTES = 30
+
+# Per NIST SP800-63B: enforce a floor on length, not composition rules.
+# Upper bound guards against hashing-cost abuse (very long inputs into scrypt).
+MIN_PASSWORD_LENGTH = 8
+MAX_PASSWORD_LENGTH = 128
+
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 if AUTH_COOKIE_SAMESITE not in {"lax", "strict"}:
     raise RuntimeError(
@@ -33,14 +45,6 @@ AUTH_COOKIE_NAME = (
 CSRF_HEADER_NAME = "X-CSRF-Token"
 CSRF_CONTEXT = b"jobhunter-pro-csrf-v1"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-
-
-@dataclass(frozen=True)
-class CurrentUser:
-    id: str
-    email: str
-    name: Optional[str]
-    is_active: bool
 
 
 def utc_now() -> datetime:
@@ -120,6 +124,32 @@ def normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
+def is_plausible_email(email: str) -> bool:
+    """
+    Cheap sanity check only — real deliverability is confirmed by the
+    reset/confirmation email actually landing, not by regex.
+    """
+    return bool(email) and bool(_EMAIL_PATTERN.match(email)) and len(email) <= 254
+
+
+def validate_password_strength(password: str) -> None:
+    """
+    Raises ValueError with a user-facing message on failure.
+
+    Deliberately does NOT enforce composition rules (uppercase/digit/symbol
+    quotas) per NIST SP800-63B guidance — length is the meaningful signal.
+    """
+    if not password or len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters"
+        )
+
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Password must be at most {MAX_PASSWORD_LENGTH} characters"
+        )
+
+
 def issue_access_token(
     conn: sqlite3.Connection,
     user_id: str,
@@ -170,6 +200,144 @@ def revoke_token(
             _hash_token(token),
         ),
     )
+
+
+def invalidate_all_sessions_for_user(
+    conn: sqlite3.Connection,
+    user_id: str,
+) -> None:
+    """
+    Called after a password change/reset. Every existing session token
+    (bearer or cookie) becomes invalid immediately, per OWASP guidance that
+    a credential change must not leave prior sessions live.
+    """
+    conn.execute(
+        """
+        UPDATE auth_sessions
+        SET revoked_at = ?
+        WHERE user_id = ?
+          AND revoked_at IS NULL
+        """,
+        (
+            utc_now().isoformat(),
+            user_id,
+        ),
+    )
+
+
+def create_password_reset_token(
+    conn: sqlite3.Connection,
+    user_id: str,
+) -> str:
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = _hash_token(raw_token)
+
+    now = utc_now()
+    expires = now + timedelta(minutes=PASSWORD_RESET_TOKEN_TTL_MINUTES)
+    token_id = secrets.token_hex(16)
+
+    conn.execute(
+        """
+        INSERT INTO password_reset_tokens (
+            id,
+            user_id,
+            token_hash,
+            created_at,
+            expires_at,
+            used_at
+        )
+        VALUES (?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            token_id,
+            user_id,
+            token_hash,
+            now.isoformat(),
+            expires.isoformat(),
+        ),
+    )
+
+    return raw_token
+
+
+def find_user_id_for_reset_token(
+    conn: sqlite3.Connection,
+    token: str,
+) -> Optional[str]:
+    row = conn.execute(
+        """
+        SELECT user_id
+        FROM password_reset_tokens
+        WHERE token_hash = ?
+          AND used_at IS NULL
+          AND expires_at > ?
+        LIMIT 1
+        """,
+        (
+            _hash_token(token),
+            utc_now().isoformat(),
+        ),
+    ).fetchone()
+
+    return row["user_id"] if row else None
+
+
+def consume_password_reset_token(
+    conn: sqlite3.Connection,
+    token: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE password_reset_tokens
+        SET used_at = ?
+        WHERE token_hash = ?
+        """,
+        (
+            utc_now().isoformat(),
+            _hash_token(token),
+        ),
+    )
+
+
+def ensure_auth_schema(conn: sqlite3.Connection) -> None:
+    """
+    Idempotent schema setup for tables owned by the authentication package.
+
+    `users` and `auth_sessions` are created by the application's main schema
+    initialization (they predate this module). `password_reset_tokens` is
+    new as of the signup/password-reset extraction and is created here so
+    the authentication package owns its own schema going forward. Call this
+    once at startup, after the main schema init, and before serving traffic.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_token_hash
+        ON password_reset_tokens(token_hash)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id
+        ON password_reset_tokens(user_id)
+        """
+    )
+
+    conn.commit()
 
 
 def csrf_token_for_session(session_token: str) -> str:
