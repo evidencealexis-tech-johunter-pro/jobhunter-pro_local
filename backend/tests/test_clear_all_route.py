@@ -9,6 +9,7 @@ sys.path.insert(
 )
 
 import main as app_module
+from notifications.service import add_notification
 from auth import hash_password
 
 

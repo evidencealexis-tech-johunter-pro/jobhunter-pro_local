@@ -13,6 +13,7 @@ sys.path.insert(
 )
 
 import main as app_module
+from notifications.service import add_notification
 from auth import AUTH_COOKIE_NAME, CSRF_HEADER_NAME, hash_password
 
 

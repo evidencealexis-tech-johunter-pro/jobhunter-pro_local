@@ -9,7 +9,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import cheap_prefilter_match
+from jobs.service import cheap_prefilter_match
 
 
 def test_short_description_always_passes_through():

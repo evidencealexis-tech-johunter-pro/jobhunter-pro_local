@@ -5,9 +5,8 @@ import uuid
 from datetime import date
 
 from fastapi import APIRouter, HTTPException
-from jobs import service as jobs_service
 
-from auth import CurrentUser, CurrentUserDep
+from authentication import CurrentUser, CurrentUserDep
 from jobs.repository import (
     clear_jobs_for_user,
     get_running_job_for_user,

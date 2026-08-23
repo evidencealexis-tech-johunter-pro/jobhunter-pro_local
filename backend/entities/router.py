@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from auth import CurrentUser, CurrentUserDep
+from authentication import CurrentUser, CurrentUserDep
 from entities.service import (
     create_entity_record,
     delete_entity_record,

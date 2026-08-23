@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 import socket
 from contextlib import asynccontextmanager
 
@@ -14,16 +13,6 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
-
-from jobs.service import (
-    background_tasks,
-    cheap_prefilter_match,
-    get_job_state,
-    run_scrape,
-)
-
-from remote_config import load_config
-from scraper import detect_and_fetch
 
 from authentication import (
     AUTH_COOKIE_NAME,
@@ -41,23 +30,18 @@ from core.config import (
 )
 from core.database import (
     get_db,
-    initialize_database,
     mark_running_jobs_interrupted,
 )
-from file_storage import (
-    MAX_UPLOAD_BYTES,
-    initialize_schema,
-)
+from file_storage import initialize_schema
 from jobs.router import router as jobs_router
 from entities.router import router as entities_router
-from notifications.service import add_notification
 from notifications.router import router as notifications_router
 from settings.router import router as settings_router
 from settings.service import (
     get_active_llm_credentials as settings_get_active_llm_credentials,
 )
-
 from uploads.router import router as uploads_router
+
 
 def call_llm_with_retry(
     system_prompt: str = "",
@@ -91,6 +75,7 @@ async def call_llm_with_retry_async(
         user_id=user_id,
         credentials_resolver=get_active_llm_credentials,
     )
+
 
 # ============================================================================
 # APPLICATION LIFECYCLE
@@ -162,6 +147,18 @@ app.add_middleware(
 # BROWSER SESSION SECURITY
 # ============================================================================
 
+# These endpoints establish or change authentication state before the
+# browser has a trusted authenticated session. They still pass the
+# cross-site and Origin protections below, but do not require a CSRF
+# token derived from an existing session cookie.
+CSRF_EXEMPT_PATHS = {
+    "/api/apps/local/auth/login",
+    "/api/apps/local/auth/signup",
+    "/api/apps/local/auth/password-reset/request",
+    "/api/apps/local/auth/password-reset/confirm",
+}
+
+
 class BrowserSessionSecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self,
@@ -169,12 +166,15 @@ class BrowserSessionSecurityMiddleware(BaseHTTPMiddleware):
         call_next,
     ):
         method = request.method.upper()
-        cookie_token = request.cookies.get(AUTH_COOKIE_NAME)
+        cookie_token = request.cookies.get(
+            AUTH_COOKIE_NAME
+        )
 
         authorization = request.headers.get(
             "Authorization",
             "",
         )
+
         has_bearer_auth = authorization.lower().startswith(
             "bearer "
         )
@@ -194,6 +194,7 @@ class BrowserSessionSecurityMiddleware(BaseHTTPMiddleware):
                 )
 
             origin = request.headers.get("Origin")
+
             if (
                 origin
                 and origin.rstrip("/") not in ALLOWED_CORS_ORIGINS
@@ -204,26 +205,32 @@ class BrowserSessionSecurityMiddleware(BaseHTTPMiddleware):
                     media_type="application/json",
                 )
 
-            supplied = request.headers.get(
-                CSRF_HEADER_NAME,
-                "",
-            )
-            expected = csrf_token_for_session(
-                cookie_token
-            )
+            # Authentication bootstrap/password-recovery endpoints
+            # cannot safely require a CSRF token tied to an existing
+            # authenticated session. Keep the origin protections above,
+            # but skip the session-token CSRF comparison for these paths.
+            if request.url.path not in CSRF_EXEMPT_PATHS:
+                supplied = request.headers.get(
+                    CSRF_HEADER_NAME,
+                    "",
+                )
 
-            if (
-                not supplied
-                or not hmac.compare_digest(
-                    supplied,
-                    expected,
+                expected = csrf_token_for_session(
+                    cookie_token
                 )
-            ):
-                return StarletteResponse(
-                    content='{"detail":"CSRF validation failed"}',
-                    status_code=403,
-                    media_type="application/json",
-                )
+
+                if (
+                    not supplied
+                    or not hmac.compare_digest(
+                        supplied,
+                        expected,
+                    )
+                ):
+                    return StarletteResponse(
+                        content='{"detail":"CSRF validation failed"}',
+                        status_code=403,
+                        media_type="application/json",
+                    )
 
         response = await call_next(request)
 
@@ -231,14 +238,17 @@ class BrowserSessionSecurityMiddleware(BaseHTTPMiddleware):
             "X-Content-Type-Options",
             "nosniff",
         )
+
         response.headers.setdefault(
             "X-Frame-Options",
             "DENY",
         )
+
         response.headers.setdefault(
             "Referrer-Policy",
             "strict-origin-when-cross-origin",
         )
+
         response.headers.setdefault(
             "Permissions-Policy",
             "camera=(), microphone=(), geolocation=()",
@@ -259,15 +269,6 @@ app.add_middleware(
 
 
 # ============================================================================
-# GENERIC ENTITY ROUTES
-#
-# Auth routes are owned by authentication.router.
-# Job routes are owned by jobs.router.
-# Notification routes are owned by notifications.router.
-# Upload routes are owned by uploads.router.
-# ============================================================================
-
-# ============================================================================
 # NETWORK STATUS
 # ============================================================================
 
@@ -278,6 +279,7 @@ def has_internet_access(
         socket.AF_INET,
         socket.SOCK_STREAM,
     )
+
     sock.settimeout(timeout)
 
     try:
@@ -301,6 +303,8 @@ async def network_status():
             has_internet_access
         )
     }
+
+
 # ============================================================================
 # LLM COMPATIBILITY BOUNDARY
 # ============================================================================
@@ -325,7 +329,6 @@ async def invoke_llm_route(
         user_id=current_user.id,
         credentials_resolver=get_active_llm_credentials,
     )
-
 
 
 # ============================================================================

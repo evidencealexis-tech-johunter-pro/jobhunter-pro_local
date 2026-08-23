@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from jobs.service import background_tasks, get_job_state, update_job_state
 
 sys.path.insert(
     0,
@@ -21,6 +22,12 @@ sys.path.insert(
 )
 
 import main as app_module
+from scraper import detect_and_fetch
+app_module.detect_and_fetch = detect_and_fetch
+app_module.background_tasks = background_tasks
+app_module.get_job_state = get_job_state
+app_module.update_job_state = update_job_state
+from notifications.service import add_notification
 from auth import hash_password
 
 
@@ -368,7 +375,8 @@ async def test_user_cannot_read_or_stop_another_users_scrape_job(
     async def fake_run_scrape(job_id, req_data, user_id):
         app_module.update_job_state(job_id, stage="test-running")
 
-    monkeypatch.setattr(app_module, "run_scrape", fake_run_scrape)
+    import jobs.router as jobs_router
+    monkeypatch.setattr(jobs_router, "run_scrape", fake_run_scrape)
 
     response = client.post(
         "/api/apps/local/integration-endpoints/Core/ScrapeJobs",

@@ -22,7 +22,7 @@ FALLBACK = {
         "anthropic": "anthropic/claude-3-haiku-20240307",
         "grok": "xai/grok-4.3",
         "local": "ollama/phi3:mini",
-        "deepseek": "deepseek/deepseek-chat",  # ← added
+        "deepseek": "deepseek/deepseek-chat", 
     },
     "providers": [
         {"id": "gemini",    "label": "Google Gemini",      "needs_base_url": False},
@@ -33,7 +33,7 @@ FALLBACK = {
         {"id": "local",     "label": "Local (Ollama)",     "needs_base_url": False},
         {"id": "custom",    "label": "Other / Custom",     "needs_base_url": True},
     ],
-    "supported_providers": ["gemini", "openai", "anthropic", "grok", "deepseek", "local", "custom"],  # ← added deepseek
+    "supported_providers": ["gemini", "openai", "anthropic", "grok", "deepseek", "local", "custom"],
 }
 
 _config_cache = None

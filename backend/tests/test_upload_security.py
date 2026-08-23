@@ -17,7 +17,13 @@ sys.path.insert(
 )
 
 from fastapi.testclient import TestClient
+
 import main as app_module
+from file_storage import MAX_UPLOAD_BYTES
+app_module.MAX_UPLOAD_BYTES = MAX_UPLOAD_BYTES
+
+from remote_config import load_config
+app_module.load_config = load_config
 from auth import hash_password
 
 

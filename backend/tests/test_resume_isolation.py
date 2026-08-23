@@ -10,6 +10,8 @@ import sys
 import uuid
 import json
 from datetime import datetime, timezone
+from jobs.service import background_tasks, get_job_state, update_job_state
+
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,6 +22,12 @@ sys.path.insert(
 )
 
 import main as app_module
+app_module.background_tasks = background_tasks
+app_module.get_job_state = get_job_state
+app_module.update_job_state = update_job_state
+from scraper import detect_and_fetch
+app_module.detect_and_fetch = detect_and_fetch
+from notifications.service import add_notification
 from auth import hash_password
 
 

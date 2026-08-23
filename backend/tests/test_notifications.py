@@ -2,6 +2,7 @@ import os
 import sys
 import uuid
 from datetime import datetime, timezone
+from notifications.service import add_notification
 
 sys.path.insert(
     0,
@@ -9,6 +10,7 @@ sys.path.insert(
 )
 
 import main as app_module
+app_module.add_notification = add_notification
 from auth import hash_password
 
 
